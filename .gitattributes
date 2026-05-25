@@ -1,0 +1,29 @@
+# Force LF line endings for all text files on checkout
+* text=auto eol=lf
+
+# Shell scripts must always use LF — CRLF breaks the shebang on Linux/macOS
+*.sh text eol=lf
+
+# Terraform files
+*.tf     text eol=lf
+*.tfvars text eol=lf
+*.hcl    text eol=lf
+
+# YAML / JSON / Markdown
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+
+# Python
+*.py text eol=lf
+
+# Binary files — no line ending conversion
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.zip  binary
+*.tar  binary
+*.gz   binary

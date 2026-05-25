@@ -1,0 +1,84 @@
+# .github/workflows/state-bucket-bootstrap.yaml
+#
+# One-time manual workflow: creates the S3 remote state bucket used by all
+# other Terraform workspaces.  Run this ONCE before the first terraform-deploy
+# run.  It is safe to re-run; Terraform's prevent_destroy guard and S3
+# bucket-exists check make the apply idempotent.
+
+name: State Bucket Bootstrap
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  bootstrap:
+    name: Bootstrap Remote State S3 Bucket
+    runs-on: ubuntu-latest
+    environment: management
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name: GitHubActions-Bootstrap
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Resolve Shared Services Account ID
+        id: resolve_shared_services
+        run: |
+          SHARED_SERVICES_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='shared-services-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          [[ -z "$SHARED_SERVICES_ID" || "$SHARED_SERVICES_ID" == "None" ]] && \
+            { echo "ERROR: shared-services-environment account not found in org"; exit 1; }
+          echo "shared_services_account_id=$SHARED_SERVICES_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Mask Org Account IDs
+        run: |
+          while IFS= read -r v; do [ -n "$v" ] && echo "::add-mask::$v"; done \
+            < <(aws organizations list-accounts --query "Accounts[].Id" --output text | tr '\t' '\n')
+          while IFS= read -r v; do [ -n "$v" ] && echo "::add-mask::$v"; done \
+            < <(aws organizations list-accounts --query "Accounts[].Email" --output text | tr '\t' '\n')
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform/bootstrap
+        run: terraform init -reconfigure -no-color
+
+      - name: Terraform Apply
+        working-directory: terraform/bootstrap
+        run: |
+          terraform apply -auto-approve -no-color \
+            -var="shared_services_account_id=${{ steps.resolve_shared_services.outputs.shared_services_account_id }}" \
+            -var="aws_region=${{ env.AWS_DEFAULT_REGION }}"
+
+          STATE_BUCKET=$(terraform output -raw state_bucket_name)
+          [[ -z "$STATE_BUCKET" ]] && { echo "ERROR: state_bucket_name output is empty"; exit 1; }
+
+          {
+            echo "### Bootstrap Complete"
+            echo "| Resource | Name |"
+            echo "|---|---|"
+            echo "| S3 Bucket | \`$STATE_BUCKET\` |"
+            echo ""
+            echo "Set the **TFSTATE_BUCKET_NAME** GitHub secret to \`$STATE_BUCKET\` before running terraform-deploy."
+          } >> "$GITHUB_STEP_SUMMARY"

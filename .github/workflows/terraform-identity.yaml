@@ -1,0 +1,460 @@
+# .github/workflows/terraform-identity.yaml
+#
+# On-demand workflow: provision AD-backed identity resources.
+#
+# Prerequisites (must be satisfied before running this workflow):
+#   1. Main deploy completed successfully (corporate VPC, DC, VPN all up)
+#   2. DC promoted: AD DS forest joined via Server Manager GUI (see user-scripts/domain-controller/cloud-dc-promo-prep.ps1)
+#   3. VPN tunnel up: pfSense Phase 1 + Phase 2 connected
+#   4. GitHub secret TF_VAR_AD_CONNECTOR_PASSWORD set to the domain
+#      Admin account password (or a delegated connector service account)
+#
+# What this workflow does:
+#   1. Corporate workspace (identity_enabled=true):
+#      - Creates Route53 Resolver outbound endpoint + forwarding rule for corp.internal
+#   2. Management workspace (identity_enabled=true):
+#      - Creates management identity stub VPC (10.3.0.0/24) + TGW attachment
+#      - Creates AD Connector in the management account (same account as IAM Identity Center)
+#   3. Networking Phase 3 (management spoke wiring):
+#      - Associates the management TGW attachment with the spoke route table
+#      - Propagates the management CIDR into the egress route table
+#      - Adds firewall pass rule for management <-> corporate AD traffic
+#
+# After this workflow completes:
+#   1. Copy the ad_connector_id from the job summary
+#   2. Open IAM Identity Center -> Settings -> Identity source -> Change to
+#      Active Directory -> paste the connector ID
+#   3. Configure attribute mappings and optionally Entra ID SAML federation
+
+name: Terraform Identity (AD Connector)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy-identity:
+    name: Deploy - AD Connector + Route 53 Resolver
+    runs-on: ubuntu-latest
+    environment: management
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name: GitHubActions-Identity
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Resolve Account IDs
+        id: resolve
+        run: |
+          CORP_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='corporate-main-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          [[ -z "$CORP_ID" || "$CORP_ID" == "None" ]] && \
+            { echo "ERROR: Cannot resolve corporate-main-environment account"; exit 1; }
+
+          SECURITY_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='security-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          [[ -z "$SECURITY_ID" || "$SECURITY_ID" == "None" ]] && \
+            { echo "ERROR: Cannot resolve security-environment account"; exit 1; }
+
+          NET_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='networking-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          [[ -z "$NET_ID" || "$NET_ID" == "None" ]] && \
+            { echo "ERROR: Cannot resolve networking-environment account"; exit 1; }
+
+          echo "corporate_account_id=$CORP_ID"    >> "$GITHUB_OUTPUT"
+          echo "security_account_id=$SECURITY_ID" >> "$GITHUB_OUTPUT"
+          echo "networking_account_id=$NET_ID"    >> "$GITHUB_OUTPUT"
+
+      - name: Mask Org Data
+        run: |
+          while IFS= read -r v; do [ -n "$v" ] && echo "::add-mask::$v"; done \
+            < <(aws organizations list-accounts --query "Accounts[].Id" --output text | tr '\t' '\n')
+          while IFS= read -r v; do [ -n "$v" ] && echo "::add-mask::$v"; done \
+            < <(aws organizations list-accounts --query "Accounts[].Email" --output text | tr '\t' '\n')
+
+      - name: Read Networking Outputs from State
+        id: net
+        run: |
+          STATE=$(aws s3 cp \
+            "s3://${{ secrets.TFSTATE_BUCKET_NAME }}/networking/terraform.tfstate" - \
+            2>/dev/null || echo "{}")
+
+          TGW_ID=$(echo "$STATE" | jq -r '.outputs.transit_gateway_id.value // empty')
+          [[ -z "$TGW_ID" ]] && \
+            { echo "ERROR: transit_gateway_id not found in networking state. Run the main deploy first."; exit 1; }
+
+          DNS_FW_ARN=$(echo "$STATE" | jq -r '.outputs.dns_firewall_rule_group_arn.value // empty')
+          [[ -z "$DNS_FW_ARN" ]] && \
+            { echo "ERROR: dns_firewall_rule_group_arn not found in networking state. Run the main deploy first."; exit 1; }
+
+          # Read existing spoke attachment IDs so Phase 3 does not destroy them.
+          CORP_ATT=$(echo "$STATE" | jq -r '
+            try (
+              .resources[]
+              | select(.type == "aws_ec2_transit_gateway_route_table_association" and .name == "corporate")
+              | .instances[0].attributes.transit_gateway_attachment_id
+            ) // ""' 2>/dev/null || echo "")
+          SECURITY_ATT=$(echo "$STATE" | jq -r '
+            try (
+              .resources[]
+              | select(.type == "aws_ec2_transit_gateway_route_table_association" and .name == "security")
+              | .instances[0].attributes.transit_gateway_attachment_id
+            ) // ""' 2>/dev/null || echo "")
+
+          echo "transit_gateway_id=$TGW_ID"              >> "$GITHUB_OUTPUT"
+          echo "dns_firewall_rule_group_arn=$DNS_FW_ARN"  >> "$GITHUB_OUTPUT"
+          echo "corporate_tgw_attachment_id=$CORP_ATT"   >> "$GITHUB_OUTPUT"
+          echo "security_tgw_attachment_id=$SECURITY_ATT" >> "$GITHUB_OUTPUT"
+          echo "INFO: transit_gateway_id=$TGW_ID"
+          echo "INFO: dns_firewall_rule_group_arn=$DNS_FW_ARN"
+          echo "INFO: corporate_tgw_attachment_id=${CORP_ATT:-(not in state)}"
+          echo "INFO: security_tgw_attachment_id=${SECURITY_ATT:-(not in state)}"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # -----------------------------------------------------------------------
+      # Step 1: Corporate workspace - Route 53 Resolver
+      # -----------------------------------------------------------------------
+
+      - name: Corporate Terraform Init
+        working-directory: terraform/corporate
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=corporate/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Detect Corporate Phase 3 Resources In State
+        id: check_corp_bucket
+        working-directory: terraform/corporate
+        run: |
+          EXISTS="false"
+          PHASE3_RESOURCES=(
+            'aws_config_delivery_channel.main[0]'
+            'aws_config_configuration_recorder_status.main[0]'
+            'aws_flow_log.corporate_vpc[0]'
+          )
+          for resource in "${PHASE3_RESOURCES[@]}"; do
+            if terraform state show "$resource" > /dev/null 2>&1; then
+              EXISTS="true"
+              echo "INFO: Phase 3 sentinel found in state: ${resource}"
+              break
+            fi
+          done
+          [[ "$EXISTS" == "false" ]] && echo "INFO: No Phase 3 resources found in state."
+          echo "org_logs_bucket_exists=${EXISTS}" >> "$GITHUB_OUTPUT"
+
+      - name: Corporate Terraform Plan
+        working-directory: terraform/corporate
+        run: terraform plan -input=false -no-color -out=tfplan.bin
+        env:
+          TF_VAR_account_id:                  ${{ steps.resolve.outputs.corporate_account_id }}
+          TF_VAR_transit_gateway_id:          ${{ steps.net.outputs.transit_gateway_id }}
+          TF_VAR_dns_firewall_rule_group_arn: ${{ steps.net.outputs.dns_firewall_rule_group_arn }}
+          TF_VAR_org_logs_bucket_arn:         "arn:aws:s3:::org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+          TF_VAR_org_logs_bucket_exists:      ${{ steps.check_corp_bucket.outputs.org_logs_bucket_exists }}
+          TF_VAR_identity_enabled:            "true"
+          TF_VAR_ad_connector_password:       ${{ secrets.TF_VAR_AD_CONNECTOR_PASSWORD }}
+
+      - name: Corporate Terraform Apply
+        working-directory: terraform/corporate
+        run: terraform apply -auto-approve -no-color tfplan.bin
+        env:
+          TF_VAR_account_id:                  ${{ steps.resolve.outputs.corporate_account_id }}
+          TF_VAR_transit_gateway_id:          ${{ steps.net.outputs.transit_gateway_id }}
+          TF_VAR_dns_firewall_rule_group_arn: ${{ steps.net.outputs.dns_firewall_rule_group_arn }}
+          TF_VAR_org_logs_bucket_arn:         "arn:aws:s3:::org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+          TF_VAR_org_logs_bucket_exists:      ${{ steps.check_corp_bucket.outputs.org_logs_bucket_exists }}
+          TF_VAR_identity_enabled:            "true"
+          TF_VAR_ad_connector_password:       ${{ secrets.TF_VAR_AD_CONNECTOR_PASSWORD }}
+
+      # -----------------------------------------------------------------------
+      # Step 2: Management workspace - stub VPC + TGW attachment + AD Connector
+      # -----------------------------------------------------------------------
+
+      - name: Management Terraform Init
+        working-directory: terraform/management
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=management/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      # Import any identity resources that exist in AWS but not in state
+      # (e.g. from a previous run that timed out before state was saved).
+      # All commands use || true so the step is fully idempotent.
+      - name: Import Orphaned Management Identity Resources
+        working-directory: terraform/management
+        continue-on-error: true
+        run: |
+          terraform import 'aws_vpc.identity[0]' \
+            "$(aws ec2 describe-vpcs --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=tag:Name,Values=management-identity-vpc" \
+              --query "Vpcs[0].VpcId" --output text 2>/dev/null)" 2>/dev/null || true
+
+          VPC_ID=$(terraform state show 'aws_vpc.identity[0]' 2>/dev/null \
+            | grep '^ *id ' | awk '{print $3}' | tr -d '"' || echo "")
+          if [[ -z "$VPC_ID" ]]; then
+            echo "INFO: VPC not in state and not found -- skipping subnet/RT imports."
+          else
+            SUBNETS=$(aws ec2 describe-subnets --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query "sort_by(Subnets, &CidrBlock)[*].SubnetId" --output text 2>/dev/null || echo "")
+            IDX=0
+            for SID in $SUBNETS; do
+              terraform import "aws_subnet.identity[$IDX]" "$SID" 2>/dev/null || true
+              IDX=$((IDX+1))
+            done
+
+            RT_ID=$(aws ec2 describe-route-tables --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=management-identity-rt" \
+              --query "RouteTables[0].RouteTableId" --output text 2>/dev/null || echo "")
+            [[ -n "$RT_ID" && "$RT_ID" != "None" ]] && \
+              terraform import 'aws_route_table.identity[0]' "$RT_ID" 2>/dev/null || true
+
+            ASSOCS=$(aws ec2 describe-route-tables --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=management-identity-rt" \
+              --query "RouteTables[0].Associations[?SubnetId!=null].[RouteTableAssociationId,SubnetId]" \
+              --output text 2>/dev/null || echo "")
+            IDX=0
+            while IFS=$'\t' read -r ASSOC_ID SUBNET_ID; do
+              [[ -z "$ASSOC_ID" || "$ASSOC_ID" == "None" ]] && continue
+              terraform import "aws_route_table_association.identity[$IDX]" "$ASSOC_ID" 2>/dev/null || true
+              IDX=$((IDX+1))
+            done <<< "$ASSOCS"
+
+            SG_ID=$(aws ec2 describe-security-groups --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=ad-connector-sg" \
+              --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "")
+            [[ -n "$SG_ID" && "$SG_ID" != "None" ]] && \
+              terraform import 'aws_security_group.ad_connector[0]' "$SG_ID" 2>/dev/null || true
+
+            TGW_ATT=$(aws ec2 describe-transit-gateway-vpc-attachments --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+                        "Name=state,Values=available,pending,modifying" \
+              --query "TransitGatewayVpcAttachments[0].TransitGatewayAttachmentId" \
+              --output text 2>/dev/null || echo "")
+            [[ -n "$TGW_ATT" && "$TGW_ATT" != "None" ]] && \
+              terraform import 'aws_ec2_transit_gateway_vpc_attachment.identity[0]' "$TGW_ATT" 2>/dev/null || true
+          fi
+        env:
+          TF_VAR_account_id:            ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_state_bucket_name:     ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_security_account_id:   ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_identity_enabled:      "true"
+          TF_VAR_transit_gateway_id:    ${{ steps.net.outputs.transit_gateway_id }}
+          TF_VAR_ad_connector_password: ${{ secrets.TF_VAR_AD_CONNECTOR_PASSWORD }}
+
+      # First apply: infrastructure only (VPC, subnets, RT, SG, TGW attachment).
+      # Completes in ~5 minutes and saves state before the long AD Connector creation.
+      - name: Management Terraform Plan - Infrastructure
+        working-directory: terraform/management
+        run: |
+          terraform plan -input=false -no-color -out=tfplan-infra.bin \
+            -target='aws_vpc.identity[0]' \
+            -target='aws_subnet.identity[0]' \
+            -target='aws_subnet.identity[1]' \
+            -target='aws_route_table.identity[0]' \
+            -target='aws_route_table_association.identity[0]' \
+            -target='aws_route_table_association.identity[1]' \
+            -target='aws_security_group.ad_connector[0]' \
+            -target='aws_ec2_transit_gateway_vpc_attachment.identity[0]'
+        env:
+          TF_VAR_account_id:            ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_state_bucket_name:     ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_security_account_id:   ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_identity_enabled:      "true"
+          TF_VAR_transit_gateway_id:    ${{ steps.net.outputs.transit_gateway_id }}
+          TF_VAR_ad_connector_password: ${{ secrets.TF_VAR_AD_CONNECTOR_PASSWORD }}
+
+      - name: Management Terraform Apply - Infrastructure
+        working-directory: terraform/management
+        run: terraform apply -auto-approve -no-color tfplan-infra.bin
+        env:
+          TF_VAR_account_id:            ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_state_bucket_name:     ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_security_account_id:   ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_identity_enabled:      "true"
+          TF_VAR_transit_gateway_id:    ${{ steps.net.outputs.transit_gateway_id }}
+          TF_VAR_ad_connector_password: ${{ secrets.TF_VAR_AD_CONNECTOR_PASSWORD }}
+
+      # Read the TGW attachment ID immediately after the infrastructure apply so
+      # Networking Phase 3 can wire up the management VPC into the TGW spoke route
+      # table BEFORE the AD Connector creation starts. Without this, the connector
+      # cannot reach the corporate DC (DNS port 53 unreachable across TGW).
+      - name: Read Management TGW Attachment ID
+        id: mgmt_out
+        working-directory: terraform/management
+        run: |
+          MGMT_ATT=$(terraform output -raw management_tgw_attachment_id 2>/dev/null || echo "")
+          echo "management_tgw_attachment_id=${MGMT_ATT}" >> "$GITHUB_OUTPUT"
+          echo "INFO: management_tgw_attachment_id=$MGMT_ATT"
+        env:
+          TF_VAR_account_id:            ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_state_bucket_name:     ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_security_account_id:   ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_identity_enabled:      "true"
+          TF_VAR_transit_gateway_id:    ${{ steps.net.outputs.transit_gateway_id }}
+          TF_VAR_ad_connector_password: ${{ secrets.TF_VAR_AD_CONNECTOR_PASSWORD }}
+
+      # -----------------------------------------------------------------------
+      # Step 3: Networking Phase 3 - management spoke RT association
+      # Runs BEFORE AD Connector creation so the management VPC has TGW routing
+      # to reach the corporate DC on ports 53/88/389/445/636/3268.
+      # -----------------------------------------------------------------------
+
+      - name: Resolve DNS Firewall Managed Domain List IDs
+        run: |
+          AGGREGATE_ID=$(aws route53resolver list-firewall-domain-lists \
+            --region "${{ env.AWS_DEFAULT_REGION }}" \
+            --query "FirewallDomainLists[?Name=='AWSManagedDomainsAggregateThreatList'].Id|[0]" \
+            --output text)
+          [[ -z "$AGGREGATE_ID" || "$AGGREGATE_ID" == "None" ]] && \
+            { echo "ERROR: Cannot resolve AWSManagedDomainsAggregateThreatList"; exit 1; }
+          echo "TF_VAR_aws_managed_domain_list_aggregate_id=$AGGREGATE_ID" >> "$GITHUB_ENV"
+
+      - name: Networking Terraform Init
+        working-directory: terraform/networking
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=networking/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Networking Terraform Plan
+        working-directory: terraform/networking
+        run: terraform plan -input=false -no-color -out=tfplan.bin
+        env:
+          TF_VAR_account_id:                    ${{ steps.resolve.outputs.networking_account_id }}
+          TF_VAR_on_prem_wan_ip:               ${{ secrets.TF_VAR_ON_PREM_WAN_IP }}
+          TF_VAR_corporate_account_id:         ${{ steps.resolve.outputs.corporate_account_id }}
+          TF_VAR_security_account_id:          ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_management_account_id:        ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_corporate_tgw_attachment_id:  ${{ steps.net.outputs.corporate_tgw_attachment_id }}
+          TF_VAR_security_tgw_attachment_id:   ${{ steps.net.outputs.security_tgw_attachment_id }}
+          TF_VAR_management_tgw_attachment_id: ${{ steps.mgmt_out.outputs.management_tgw_attachment_id }}
+          TF_VAR_security_log_bucket_name:     "org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+          TF_VAR_org_logs_bucket_exists:       "true"
+          # TF_VAR_aws_managed_domain_list_aggregate_id inherited from $GITHUB_ENV
+
+      - name: Networking Terraform Apply
+        working-directory: terraform/networking
+        run: terraform apply -auto-approve -no-color tfplan.bin
+        env:
+          TF_VAR_account_id:                    ${{ steps.resolve.outputs.networking_account_id }}
+          TF_VAR_on_prem_wan_ip:               ${{ secrets.TF_VAR_ON_PREM_WAN_IP }}
+          TF_VAR_corporate_account_id:         ${{ steps.resolve.outputs.corporate_account_id }}
+          TF_VAR_security_account_id:          ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_management_account_id:        ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_corporate_tgw_attachment_id:  ${{ steps.net.outputs.corporate_tgw_attachment_id }}
+          TF_VAR_security_tgw_attachment_id:   ${{ steps.net.outputs.security_tgw_attachment_id }}
+          TF_VAR_management_tgw_attachment_id: ${{ steps.mgmt_out.outputs.management_tgw_attachment_id }}
+          TF_VAR_security_log_bucket_name:     "org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+          TF_VAR_org_logs_bucket_exists:       "true"
+          # TF_VAR_aws_managed_domain_list_aggregate_id inherited from $GITHUB_ENV
+
+      # -----------------------------------------------------------------------
+      # Step 4: AD Connector - fresh 2-hour credentials, TGW routing now active
+      # -----------------------------------------------------------------------
+
+      # Refresh credentials before the AD Connector creation which takes 45-75 minutes.
+      # The OIDC token issued at job start expires at 1 hour; without a refresh the
+      # Terraform state upload fails mid-apply and the connector is left orphaned.
+      #
+      # role-duration-seconds: 7200 requests a 2-hour STS session so the state upload
+      # succeeds even if the connector creation runs to 75 minutes.
+      # PREREQUISITE: the GitHub-OIDC IAM role MaxSessionDuration must be >= 7200.
+      # Update via console (IAM -> Roles -> GitHub-OIDC -> Edit -> Max session duration
+      # -> 2 hours) or CLI: aws iam update-role --role-name GitHub-OIDC --max-session-duration 7200
+      - name: Refresh AWS Credentials Before AD Connector
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:       arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name:    GitHubActions-Identity-Connector
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+
+      # Second apply: AD Connector only (-target ensures no other management resources
+      # consume the 2-hour window before the connector creation starts).
+      - name: Management Terraform Plan - AD Connector
+        working-directory: terraform/management
+        run: |
+          terraform plan -input=false -no-color -out=tfplan-connector.bin \
+            -target='aws_directory_service_directory.ad_connector[0]'
+        env:
+          TF_VAR_account_id:            ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_state_bucket_name:     ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_security_account_id:   ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_identity_enabled:      "true"
+          TF_VAR_transit_gateway_id:    ${{ steps.net.outputs.transit_gateway_id }}
+          TF_VAR_ad_connector_password: ${{ secrets.TF_VAR_AD_CONNECTOR_PASSWORD }}
+
+      - name: Management Terraform Apply - AD Connector
+        working-directory: terraform/management
+        run: terraform apply -auto-approve -no-color tfplan-connector.bin
+        env:
+          TF_VAR_account_id:            ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_state_bucket_name:     ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_security_account_id:   ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_identity_enabled:      "true"
+          TF_VAR_transit_gateway_id:    ${{ steps.net.outputs.transit_gateway_id }}
+          TF_VAR_ad_connector_password: ${{ secrets.TF_VAR_AD_CONNECTOR_PASSWORD }}
+
+      - name: Read AD Connector ID
+        id: connector_out
+        working-directory: terraform/management
+        run: |
+          AD_ID=$(terraform output -raw ad_connector_id 2>/dev/null || echo "(not yet available)")
+          echo "ad_connector_id=${AD_ID}" >> "$GITHUB_OUTPUT"
+          echo "INFO: ad_connector_id=$AD_ID"
+        env:
+          TF_VAR_account_id:            ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_state_bucket_name:     ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_security_account_id:   ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_identity_enabled:      "true"
+          TF_VAR_transit_gateway_id:    ${{ steps.net.outputs.transit_gateway_id }}
+          TF_VAR_ad_connector_password: ${{ secrets.TF_VAR_AD_CONNECTOR_PASSWORD }}
+
+      - name: Show Identity Outputs
+        run: |
+          AD_ID="${{ steps.connector_out.outputs.ad_connector_id }}"
+          {
+            echo "### Identity Deployment Complete"
+            echo ""
+            echo "| Resource | Value |"
+            echo "|---|---|"
+            echo "| AD Connector ID | \`${AD_ID}\` |"
+            echo ""
+            echo "**Next steps:**"
+            echo "1. Open IAM Identity Center -> Settings -> Identity source -> Change to Active Directory"
+            echo "2. Select the AD Connector above"
+            echo "3. Configure attribute mappings and optionally Entra ID SAML federation"
+          } >> "$GITHUB_STEP_SUMMARY"

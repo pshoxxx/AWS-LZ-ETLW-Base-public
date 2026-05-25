@@ -1,0 +1,20 @@
+name: Load buildspec variables
+description: Parse buildspec.yml env.variables and export to GITHUB_ENV
+
+runs:
+  using: composite
+  steps:
+    - name: Export variables
+      shell: bash
+      run: |
+        python3 << 'EOF'
+        import os, re
+        content = open('buildspec.yml').read()
+        m = re.search(r'variables:\n((?:[ \t]+[A-Z_]+:[^\n]*\n?)+)', content)
+        if m:
+            with open(os.environ['GITHUB_ENV'], 'a') as env_file:
+                for line in m.group(1).splitlines():
+                    k, _, v = line.strip().partition(': ')
+                    if k and v:
+                        env_file.write(k + '=' + v.strip().strip('"') + '\n')
+        EOF

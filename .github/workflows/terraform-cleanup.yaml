@@ -1,0 +1,2960 @@
+# .github/workflows/cleanup.yaml
+#
+# Tears down the entire landing zone in dependency-safe order.
+# The S3 Terraform state bucket is intentionally preserved so the
+# deployment can be re-run without bootstrapping from scratch.
+#
+# Destruction order (reverse of deploy):
+#   1. management   -- remove SCPs first so they don't block member account cleanup
+#   2. security  \
+#      corporate  |-- parallel; all TGW attachments and PrivateLink producer removed
+#      web       /
+#   3. networking   -- TGW, Network Firewall, DNS Firewall, VPN, Egress VPC
+#
+# The bootstrap state bucket (terraform/bootstrap) is NOT destroyed.
+# All jobs are manually triggered only (workflow_dispatch).
+
+name: Terraform Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      preserve_domain_controllers:
+        description: "Save the Domain Controller as an AMI before destroying it. Check this if you plan to redeploy or cannot sit through the full AD sync time — the next deploy will restore it automatically. (Destroys resources from: web, security, corporate, networking)"
+        required: true
+        type: boolean
+        default: false
+      destroy_management:
+        description: "Destroy management account resources (SCPs, CloudTrail, Config, alarms). Leave unchecked to only clean up member accounts."
+        required: true
+        type: boolean
+        default: false
+      destroy_state_bucket:
+        description: "Delete the Terraform state bucket. Only check this if starting completely from scratch — all state will be lost and bootstrap must be re-run (destroys almost everything, check README for what it doesn't cover)."
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Job 1 - Destroy Security
+  # --------------------------------------------------------------------------
+  destroy-security:
+    name: Destroy - security
+    runs-on: ubuntu-latest
+    environment: management
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:       arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name:    GitHubActions-Destroy-security
+          aws-region:           ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Resolve Account IDs
+        id: resolve
+        run: |
+          SECURITY_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='security-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          NETWORKING_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='networking-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          CORPORATE_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='corporate-main-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          echo "corporate_account_id=${CORPORATE_ID}" >> "$GITHUB_OUTPUT"
+          echo "account_id=${SECURITY_ID}"            >> "$GITHUB_OUTPUT"
+          echo "networking_account_id=${NETWORKING_ID}" >> "$GITHUB_OUTPUT"
+          echo "TF_VAR_account_id=${SECURITY_ID}"     >> "$GITHUB_ENV"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # =====================================================================
+      # Clean up cross-account OAM links + management TF state references
+      # BEFORE destroying security. The OAM sink lives in security's state,
+      # but the links pointing at it live in management's state and exist in
+      # each source account. If we destroy security first, the sink goes
+      # away and management's state holds stale link refs that error out
+      # on the next plan with ResourceNotFoundException.
+      #
+      # Sequence:
+      #   1. From management workspace, terraform state rm the three OAM
+      #      link resources so management forgets them.
+      #   2. From each source account (networking, corporate, web), call
+      #      aws oam delete-link to remove the AWS-side resource that points
+      #      at security's about-to-be-destroyed sink.
+      #
+      # Both steps are idempotent and best-effort -- if links don't exist
+      # in state or AWS, the step continues without error so cleanup
+      # remains resilient to partial prior states.
+      # =====================================================================
+      - name: Cleanup OAM Links (management state + source account AWS resources)
+        env:
+          NETWORKING_ACCOUNT_ID: ${{ steps.resolve.outputs.networking_account_id }}
+          CORPORATE_ACCOUNT_ID:  ${{ steps.resolve.outputs.corporate_account_id }}
+        run: |
+          set +e
+
+          # 1. Resolve web account ID (not in the existing Resolve step)
+          WEB_ACCOUNT_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='web-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text 2>/dev/null)
+          [ "${WEB_ACCOUNT_ID}" = "None" ] && WEB_ACCOUNT_ID=""
+
+          # 2. Remove links from each source account in AWS
+          remove_aws_link() {
+            local acct="$1" label="$2"
+            [ -z "${acct}" ] && { echo "  ${label}: account ID empty, skipping"; return; }
+            local creds
+            creds=$(aws sts assume-role \
+              --role-arn "arn:aws:iam::${acct}:role/OrganizationAccountAccessRole" \
+              --role-session-name "OAMLinkCleanup-${label}" \
+              --duration-seconds 900 \
+              --output json 2>/dev/null)
+            [ -z "${creds}" ] && { echo "  ${label}: could not assume role, skipping"; return; }
+
+            local link_ids
+            link_ids=$(AWS_ACCESS_KEY_ID="$(echo "${creds}" | jq -r '.Credentials.AccessKeyId')" \
+                       AWS_SECRET_ACCESS_KEY="$(echo "${creds}" | jq -r '.Credentials.SecretAccessKey')" \
+                       AWS_SESSION_TOKEN="$(echo "${creds}" | jq -r '.Credentials.SessionToken')" \
+                       aws oam list-links --region "${AWS_DEFAULT_REGION}" \
+                       --query 'Items[].Arn' --output text 2>/dev/null)
+            if [ -z "${link_ids}" ]; then
+              echo "  ${label} (${acct}): no OAM links present"
+              return
+            fi
+            for link_arn in ${link_ids}; do
+              AWS_ACCESS_KEY_ID="$(echo "${creds}" | jq -r '.Credentials.AccessKeyId')" \
+              AWS_SECRET_ACCESS_KEY="$(echo "${creds}" | jq -r '.Credentials.SecretAccessKey')" \
+              AWS_SESSION_TOKEN="$(echo "${creds}" | jq -r '.Credentials.SessionToken')" \
+                aws oam delete-link --identifier "${link_arn}" --region "${AWS_DEFAULT_REGION}" >/dev/null 2>&1 \
+                && echo "  ${label} (${acct}): deleted link ${link_arn}" \
+                || echo "  ${label} (${acct}): could not delete ${link_arn} (already gone?)"
+            done
+          }
+          echo "Removing AWS-side OAM links from each source account ..."
+          remove_aws_link "${NETWORKING_ACCOUNT_ID}" "networking"
+          remove_aws_link "${CORPORATE_ACCOUNT_ID}"  "corporate"
+          remove_aws_link "${WEB_ACCOUNT_ID}"        "web"
+
+          # 3. Remove the link references from management's TF state
+          echo ""
+          echo "Removing OAM link resources from management Terraform state ..."
+          MGMT_DIR="$GITHUB_WORKSPACE/terraform/management"
+          if [ -d "${MGMT_DIR}" ]; then
+            cd "${MGMT_DIR}"
+            terraform init -no-color -reconfigure \
+              -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+              -backend-config="key=management/terraform.tfstate" \
+              -backend-config="region=${AWS_DEFAULT_REGION}" \
+              -backend-config="encrypt=true" \
+              -backend-config="use_lockfile=true" >/dev/null 2>&1
+
+            for addr in aws_oam_link.networking aws_oam_link.corporate aws_oam_link.web; do
+              if terraform state list 2>/dev/null | grep -q "^${addr}\(\[0\]\)\?$"; then
+                terraform state rm "${addr}" 2>/dev/null \
+                  && echo "  Removed ${addr} from management state" \
+                  || terraform state rm "${addr}[0]" 2>/dev/null \
+                  && echo "  Removed ${addr}[0] from management state" \
+                  || echo "  Could not remove ${addr} from management state"
+              else
+                echo "  ${addr} not in management state -- skipping"
+              fi
+            done
+            cd - >/dev/null
+          else
+            echo "  terraform/management not present in checkout -- skipping state cleanup"
+          fi
+
+          set -e
+          echo ""
+          echo "OAM cleanup complete. security workspace destroy can now proceed safely."
+
+      - name: Terraform Init
+        working-directory: terraform/security
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=security/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Release Stale State Lock
+        # Terraform 1.10+ uses S3 native locking (use_lockfile=true). The lock
+        # file is acquired via If-None-Match: * conditional PUT. If a previous
+        # run was interrupted, the lock file may remain. Manually deleting it
+        # via the S3 console only adds a delete marker; the versioned object
+        # still exists and the conditional PUT fails with HTTP 412. This step
+        # deletes all versions and delete markers of the lock file so the next
+        # terraform operation can acquire a fresh lock.
+        run: |
+          BUCKET="${{ secrets.TFSTATE_BUCKET_NAME }}"
+          KEY="security/terraform.tfstate.lock.info"
+          BATCH=$(aws s3api list-object-versions \
+            --bucket "$BUCKET" --prefix "$KEY" --output json 2>/dev/null || echo '{}')
+          OBJECTS=$(echo "$BATCH" | jq -c '{
+            Objects: (
+              [(.Versions // [])[] | {Key:.Key, VersionId:.VersionId}] +
+              [(.DeleteMarkers // [])[] | {Key:.Key, VersionId:.VersionId}]
+            )
+          }')
+          COUNT=$(echo "$OBJECTS" | jq '.Objects | length')
+          if [[ "$COUNT" -gt "0" ]]; then
+            echo "Clearing ${COUNT} stale lock file version(s)..."
+            aws s3api delete-objects --bucket "$BUCKET" --delete "$OBJECTS" 2>/dev/null && \
+              echo "Lock cleared." || echo "Warning: could not clear all lock versions."
+          else
+            echo "No stale lock file found."
+          fi
+
+      - name: Delete Orphaned VPCs
+        # Previous failed deploys can leave behind VPCs that are not in
+        # Terraform state. These block clean redeployment and must be
+        # removed before the main destroy runs. The current VPC (tagged
+        # with Name=security-vpc or Name=corporate-vpc) is identified and
+        # preserved -- all others are deleted.
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteOrphanVPCs" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          # Get all non-default VPCs
+          ALL_VPCS=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=isDefault,Values=false" \
+            --query "Vpcs[].VpcId" \
+            --output text 2>/dev/null || echo "")
+
+          for VPC_ID in $ALL_VPCS; do
+            # Check if this VPC has any remaining dependencies before deleting
+            SUBNETS=$(aws ec2 describe-subnets \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query "Subnets[].SubnetId" --output text 2>/dev/null || echo "")
+            for SUBNET in $SUBNETS; do
+              aws ec2 delete-subnet --subnet-id "$SUBNET" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+
+            IGW_IDS=$(aws ec2 describe-internet-gateways \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=attachment.vpc-id,Values=${VPC_ID}" \
+              --query "InternetGateways[].InternetGatewayId" --output text 2>/dev/null || echo "")
+            for IGW in $IGW_IDS; do
+              aws ec2 detach-internet-gateway --internet-gateway-id "$IGW" \
+                --vpc-id "$VPC_ID" --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+              aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+
+            RTS=$(aws ec2 describe-route-tables \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query "RouteTables[?Associations[0].Main!=\`true\`].RouteTableId" \
+              --output text 2>/dev/null || echo "")
+            for RT in $RTS; do
+              aws ec2 delete-route-table --route-table-id "$RT" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+
+            SG_IDS=$(aws ec2 describe-security-groups \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query "SecurityGroups[?GroupName!='default'].GroupId" \
+              --output text 2>/dev/null || echo "")
+            for SG in $SG_IDS; do
+              aws ec2 delete-security-group --group-id "$SG" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+
+            echo "Deleting orphaned VPC: ${VPC_ID}"
+            aws ec2 delete-vpc --vpc-id "$VPC_ID" \
+              --region "$AWS_DEFAULT_REGION" 2>/dev/null && \
+              echo "  Deleted: ${VPC_ID}" || \
+              echo "  Could not delete ${VPC_ID} -- may still have dependencies."
+          done
+
+      - name: Delete Resolver Query Log Configs and Interface VPC Endpoints
+        # Route53 Resolver query log configs and interface VPC endpoints both
+        # create ENIs in the private subnet. Both must be explicitly deleted
+        # via CLI before Terraform destroy runs -- removing them from state
+        # alone does not delete the AWS resource or release the ENI.
+        # The S3 Gateway endpoint does not create ENIs and is not affected.
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteEndpoints-security" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          # Delete Route53 Resolver query log config and association first.
+          # These create resolver ENIs that block subnet deletion.
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=tag:Name,Values=security-vpc" \
+            --query "Vpcs[0].VpcId" --output text 2>/dev/null || echo "")
+
+          if [ -n "$VPC_ID" ] && [ "$VPC_ID" != "None" ]; then
+            # List all associations for this VPC including FAILED state.
+            # FAILED associations block new ones from being created and must
+            # be explicitly disassociated before the config can be deleted.
+            ASSOC_JSON=$(aws route53resolver list-resolver-query-log-config-associations \
+              --region "$AWS_DEFAULT_REGION" \
+              --query "ResolverQueryLogConfigAssociations[?ResourceId=='${VPC_ID}'].{Id:Id,ConfigId:ResolverQueryLogConfigId,Status:Status}" \
+              --output json 2>/dev/null || echo "[]")
+
+            echo "$ASSOC_JSON" | jq -c '.[]' | while read -r assoc; do
+              ASSOC_ID=$(echo "$assoc" | jq -r '.Id')
+              CONFIG_ID=$(echo "$assoc" | jq -r '.ConfigId')
+              STATUS=$(echo "$assoc" | jq -r '.Status')
+              echo "Disassociating Route53 query log association: ${ASSOC_ID} (status: ${STATUS})"
+              aws route53resolver disassociate-resolver-query-log-config \
+                --region "$AWS_DEFAULT_REGION" \
+                --resolver-query-log-config-id "$CONFIG_ID" \
+                --resource-id "$VPC_ID" 2>/dev/null || true
+            done
+
+            CONFIG_IDS=$(aws route53resolver list-resolver-query-log-configs \
+              --region "$AWS_DEFAULT_REGION" \
+              --query "ResolverQueryLogConfigs[?Name=='security-vpc-dns-query-logs'].Id" \
+              --output text 2>/dev/null || echo "")
+            for CONFIG_ID in $CONFIG_IDS; do
+              echo "Deleting Route53 query log config: ${CONFIG_ID}"
+              aws route53resolver delete-resolver-query-log-config \
+                --region "$AWS_DEFAULT_REGION" \
+                --resolver-query-log-config-id "$CONFIG_ID" 2>/dev/null || true
+            done
+            echo "Waiting 30s for resolver ENIs to release..."
+            sleep 30
+          fi
+
+          ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=vpc-endpoint-type,Values=Interface" \
+                      "Name=vpc-endpoint-state,Values=available,pending,pending-acceptance" \
+            --query "VpcEndpoints[*].VpcEndpointId" \
+            --output text)
+
+          if [ -z "$ENDPOINT_IDS" ] || [ "$ENDPOINT_IDS" = "None" ]; then
+            echo "No interface endpoints found. Nothing to delete."
+          else
+            echo "Deleting endpoints: ${ENDPOINT_IDS}"
+            aws ec2 delete-vpc-endpoints \
+              --region "$AWS_DEFAULT_REGION" \
+              --vpc-endpoint-ids ${ENDPOINT_IDS}
+          fi
+
+          echo "Waiting for endpoints to reach deleted state (up to 10 minutes)..."
+          for i in $(seq 1 60); do
+            PENDING=$(aws ec2 describe-vpc-endpoints \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-endpoint-type,Values=Interface" \
+                        "Name=vpc-endpoint-state,Values=deleting,available,pending" \
+              --query "length(VpcEndpoints)" \
+              --output text)
+            [ "$PENDING" -eq "0" ] && echo "All endpoints deleted." && break
+            echo "Still waiting -- ${PENDING} endpoint(s) in progress. (${i}/60)"
+            sleep 10
+          done
+
+      - name: Delete Orphaned Network Interfaces
+        # After endpoint deletion the backing ENIs can linger for several
+        # minutes. This step polls until all endpoint-type ENIs in the
+        # security VPC are gone before Terraform destroy runs.
+        # Scoped to the security VPC by tag to avoid touching other accounts.
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteOrphanedENIs-security" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          # Resolve the security VPC ID to scope ENI lookups
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=tag:Name,Values=security-vpc" \
+            --query "Vpcs[0].VpcId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "Security VPC not found -- nothing to clean up."
+            exit 0
+          fi
+
+          echo "Cleaning up ENIs in VPC: ${VPC_ID}"
+
+          # Pass 1: delete available ENIs in the VPC
+          AVAILABLE_ENIS=$(aws ec2 describe-network-interfaces \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=vpc-id,Values=${VPC_ID}" "Name=status,Values=available" \
+            --query "NetworkInterfaces[*].NetworkInterfaceId" \
+            --output text)
+
+          if [ -z "$AVAILABLE_ENIS" ] || [ "$AVAILABLE_ENIS" = "None" ]; then
+            echo "No available ENIs found in VPC."
+          else
+            for ENI_ID in $AVAILABLE_ENIS; do
+              echo "Deleting available ENI: ${ENI_ID}"
+              aws ec2 delete-network-interface \
+                --region "$AWS_DEFAULT_REGION" \
+                --network-interface-id "$ENI_ID" || \
+                echo "WARNING: Could not delete ${ENI_ID} -- skipping."
+            done
+          fi
+
+          # Pass 2: poll until all vpc_endpoint-type ENIs in the VPC are gone.
+          # AWS releases these asynchronously after endpoint deletion -- polling
+          # is the only reliable approach. 30 iterations x 20s = 10 min max.
+          echo "Polling for vpc_endpoint ENIs in VPC ${VPC_ID} (up to 10 minutes)..."
+          for i in $(seq 1 30); do
+            ENDPOINT_ENIS=$(aws ec2 describe-network-interfaces \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+                        "Name=interface-type,Values=vpc_endpoint" \
+              --query "NetworkInterfaces[*].NetworkInterfaceId" \
+              --output text)
+
+            if [ -z "$ENDPOINT_ENIS" ] || [ "$ENDPOINT_ENIS" = "None" ]; then
+              echo "All endpoint ENIs released. Safe to proceed with destroy."
+              exit 0
+            fi
+
+            echo "Pass ${i}/30 -- endpoint ENIs still present: ${ENDPOINT_ENIS}"
+            # Attempt deletion on each pass -- AWS will allow it once released
+            for ENI_ID in $ENDPOINT_ENIS; do
+              aws ec2 delete-network-interface \
+                --region "$AWS_DEFAULT_REGION" \
+                --network-interface-id "$ENI_ID" 2>/dev/null && \
+                echo "Deleted: ${ENI_ID}" || true
+            done
+            sleep 20
+          done
+
+          echo "::warning::Some endpoint ENIs may still be present -- destroy may encounter DependencyViolation on first attempt."
+          exit 0
+
+      - name: Delete Non-Default Security Groups
+        # Deletes all non-default security groups in the security VPC before
+        # Terraform destroy runs. Non-default SGs block VPC deletion if they
+        # still exist when Terraform attempts to delete the VPC.
+        # The default SG cannot be deleted and does not block VPC deletion.
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteSGs-security" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=tag:Name,Values=security-vpc" \
+            --query "Vpcs[0].VpcId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "INFO: Security VPC not found -- nothing to clean up."
+            exit 0
+          fi
+
+          SG_IDS=$(aws ec2 describe-security-groups \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=vpc-id,Values=${VPC_ID}" \
+            --query "SecurityGroups[?GroupName!='default'].GroupId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$SG_IDS" ] || [ "$SG_IDS" = "None" ]; then
+            echo "INFO: No non-default security groups found in ${VPC_ID}."
+            exit 0
+          fi
+
+          # Revoke all inbound and outbound rules before deleting. Cross-SG
+          # references (e.g. dc-sg allows traffic from ssm-endpoints-sg) cause
+          # DependencyViolation when deleting individually. Revoking all rules
+          # first breaks circular references so every SG can be deleted cleanly.
+          for SG_ID in $SG_IDS; do
+            echo "Revoking rules from: ${SG_ID}"
+            INGRESS=$(aws ec2 describe-security-groups \
+              --region "$AWS_DEFAULT_REGION" --group-ids "$SG_ID" \
+              --query "SecurityGroups[0].IpPermissions" \
+              --output json 2>/dev/null || echo "[]")
+            if [[ "$INGRESS" != "[]" && "$INGRESS" != "null" && -n "$INGRESS" ]]; then
+              aws ec2 revoke-security-group-ingress \
+                --region "$AWS_DEFAULT_REGION" --group-id "$SG_ID" \
+                --ip-permissions "$INGRESS" 2>/dev/null || true
+            fi
+            EGRESS=$(aws ec2 describe-security-groups \
+              --region "$AWS_DEFAULT_REGION" --group-ids "$SG_ID" \
+              --query "SecurityGroups[0].IpPermissionsEgress" \
+              --output json 2>/dev/null || echo "[]")
+            if [[ "$EGRESS" != "[]" && "$EGRESS" != "null" && -n "$EGRESS" ]]; then
+              aws ec2 revoke-security-group-egress \
+                --region "$AWS_DEFAULT_REGION" --group-id "$SG_ID" \
+                --ip-permissions "$EGRESS" 2>/dev/null || true
+            fi
+          done
+
+          for SG_ID in $SG_IDS; do
+            echo "Deleting security group: ${SG_ID}"
+            aws ec2 delete-security-group \
+              --region "$AWS_DEFAULT_REGION" \
+              --group-id "$SG_ID" 2>/dev/null && \
+              echo "  Deleted: ${SG_ID}" || \
+              echo "  WARNING: Could not delete ${SG_ID} -- skipping."
+          done
+
+      - name: Delete Transit Gateway VPC Attachment
+        # The TGW VPC attachment creates ENIs in the private subnet that stay
+        # in-use state until the attachment is fully deleted. Terraform destroy
+        # cannot delete the subnet or VPC while those ENIs remain, producing a
+        # DependencyViolation after its 20-minute timeout. Deleting the attachment
+        # here and polling until gone ensures the ENIs are released before destroy.
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteTGWAttach-security" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=tag:Name,Values=security-vpc" \
+            --query "Vpcs[0].VpcId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "Security VPC not found -- skipping TGW attachment cleanup."
+            exit 0
+          fi
+
+          ATTACH_IDS=$(aws ec2 describe-transit-gateway-vpc-attachments \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=vpc-id,Values=${VPC_ID}" \
+                      "Name=state,Values=available,modifying,pending" \
+            --query "TransitGatewayVpcAttachments[].TransitGatewayAttachmentId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$ATTACH_IDS" ] || [ "$ATTACH_IDS" = "None" ]; then
+            echo "No active TGW VPC attachments found for ${VPC_ID}."
+            exit 0
+          fi
+
+          for ATTACH_ID in $ATTACH_IDS; do
+            echo "Deleting TGW VPC attachment: ${ATTACH_ID}"
+            aws ec2 delete-transit-gateway-vpc-attachment \
+              --transit-gateway-attachment-id "$ATTACH_ID" \
+              --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+          done
+
+          echo "Polling until TGW attachments are deleted (releases ENIs, up to 5 min)..."
+          for i in $(seq 1 30); do
+            REMAINING=$(aws ec2 describe-transit-gateway-vpc-attachments \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+                        "Name=state,Values=available,modifying,pending,deleting" \
+              --query "length(TransitGatewayVpcAttachments)" \
+              --output text 2>/dev/null || echo "0")
+            echo "  Attachments still active: ${REMAINING} (check ${i}/30)"
+            [ "$REMAINING" -eq "0" ] && echo "  All TGW attachments deleted." && break
+            sleep 10
+          done
+
+      - name: Remove Protected Resources from Terraform State
+        # Removes resources that must survive destroy from state so Terraform
+        # skips them during destroy. Three categories:
+        #   1. S3 log bucket and KMS key (preserve audit trail)
+        #   2. SCP-protected security services (SCPs block deletion)
+        #   3. VPC endpoints (already deleted above; removed from state so
+        #      Terraform does not attempt a second delete and error out)
+        working-directory: terraform/security
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+          # S3 log bucket and KMS key
+          terraform state rm aws_s3_bucket.org_logs 2>/dev/null || true
+          terraform state rm aws_s3_bucket_policy.org_logs 2>/dev/null || true
+          terraform state rm aws_s3_bucket_versioning.org_logs 2>/dev/null || true
+          terraform state rm aws_s3_bucket_server_side_encryption_configuration.org_logs 2>/dev/null || true
+          terraform state rm aws_s3_bucket_lifecycle_configuration.org_logs 2>/dev/null || true
+          terraform state rm aws_s3_bucket_public_access_block.org_logs 2>/dev/null || true
+          terraform state rm aws_s3_bucket_ownership_controls.org_logs 2>/dev/null || true
+          terraform state rm aws_kms_key.org_logs_cmk 2>/dev/null || true
+          terraform state rm aws_kms_alias.org_logs_cmk 2>/dev/null || true
+
+          # Cancel any pending KMS key deletion so the key remains available
+          # for reimport on the next deploy. KMS keys have a mandatory minimum
+          # deletion window of 7 days (30 days configured here). Without this
+          # step the key enters PENDING_DELETION state and the alias becomes
+          # unusable, causing AlreadyExistsException on the next deploy when
+          # Terraform tries to create a new alias against the same name.
+          SEC_CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-CancelKMSDeletion" \
+            --output json 2>/dev/null || echo "{}")
+          if [[ "$(echo "$SEC_CREDS" | jq -r '.Credentials.AccessKeyId // empty')" != "" ]]; then
+            export KMS_KEY_ID=$(AWS_ACCESS_KEY_ID=$(echo "$SEC_CREDS" | jq -r '.Credentials.AccessKeyId') \
+              AWS_SECRET_ACCESS_KEY=$(echo "$SEC_CREDS" | jq -r '.Credentials.SecretAccessKey') \
+              AWS_SESSION_TOKEN=$(echo "$SEC_CREDS" | jq -r '.Credentials.SessionToken') \
+              aws kms describe-key \
+                --key-id "alias/org-logs-cmk" \
+                --region "$AWS_DEFAULT_REGION" \
+                --query "KeyMetadata.KeyId" \
+                --output text 2>/dev/null || echo "")
+            if [[ -n "$KMS_KEY_ID" && "$KMS_KEY_ID" != "None" ]]; then
+              AWS_ACCESS_KEY_ID=$(echo "$SEC_CREDS" | jq -r '.Credentials.AccessKeyId') \
+              AWS_SECRET_ACCESS_KEY=$(echo "$SEC_CREDS" | jq -r '.Credentials.SecretAccessKey') \
+              AWS_SESSION_TOKEN=$(echo "$SEC_CREDS" | jq -r '.Credentials.SessionToken') \
+              aws kms cancel-key-deletion \
+                --key-id "$KMS_KEY_ID" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null && \
+                echo "INFO: Cancelled pending deletion for KMS key ${KMS_KEY_ID}" || \
+                echo "INFO: KMS key not in pending deletion state -- no action needed."
+            fi
+          fi
+
+          # SCP-protected security services - SCPs block deletion so we keep
+          # these services running and just remove them from Terraform state.
+          # Re-import them on next deploy to bring them back under management.
+          terraform state rm aws_guardduty_detector.main 2>/dev/null || true
+          terraform state rm aws_guardduty_organization_configuration.main 2>/dev/null || true
+          terraform state rm aws_guardduty_publishing_destination.s3 2>/dev/null || true
+          terraform state rm aws_securityhub_account.main 2>/dev/null || true
+          terraform state rm aws_securityhub_organization_configuration.main 2>/dev/null || true
+          terraform state rm aws_securityhub_standards_subscription.fsbp 2>/dev/null || true
+          terraform state rm aws_securityhub_standards_subscription.cis 2>/dev/null || true
+          terraform state rm aws_accessanalyzer_analyzer.org 2>/dev/null || true
+          terraform state rm aws_inspector2_enabler.main 2>/dev/null || true
+          terraform state rm aws_inspector2_organization_configuration.main 2>/dev/null || true
+          terraform state rm aws_macie2_account.main 2>/dev/null || true
+          terraform state rm aws_iam_service_linked_role.config 2>/dev/null || true
+
+          # Config resources - config:StopConfigurationRecorder blocked by SCP
+          terraform state rm aws_config_configuration_recorder.main 2>/dev/null || true
+          terraform state rm aws_config_delivery_channel.main 2>/dev/null || true
+          terraform state rm aws_config_configuration_recorder_status.main 2>/dev/null || true
+
+          # Remove TGW attachment from state.
+          # The TGW is owned by the networking account -- all TGW attachment
+          # deletion is handled by destroy-networking which runs after all
+          # member account destroys complete. Removing from state here
+          # prevents Terraform from trying to delete the attachment itself
+          # which would conflict with the networking destroy job.
+          terraform state rm aws_ec2_transit_gateway_vpc_attachment.main 2>/dev/null || true
+          terraform state rm aws_route53_resolver_query_log_config.security 2>/dev/null || true
+          terraform state rm aws_route53_resolver_query_log_config_association.security 2>/dev/null || true
+
+          # Athena workgroup -- must be empty before deletion.
+          # Delete all named queries and query executions in the workgroup.
+          SEC_CREDS_ATHENA=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-ClearAthena" \
+            --output json 2>/dev/null || echo "{}")
+          if [[ "$(echo "$SEC_CREDS_ATHENA" | jq -r '.Credentials.AccessKeyId // empty')" != "" ]]; then
+            export _AK=$(echo "$SEC_CREDS_ATHENA" | jq -r '.Credentials.AccessKeyId')
+            export _SK=$(echo "$SEC_CREDS_ATHENA" | jq -r '.Credentials.SecretAccessKey')
+            export _ST=$(echo "$SEC_CREDS_ATHENA" | jq -r '.Credentials.SessionToken')
+
+            # Delete named queries
+            QUERY_IDS=$(AWS_ACCESS_KEY_ID=$_AK AWS_SECRET_ACCESS_KEY=$_SK AWS_SESSION_TOKEN=$_ST \
+              aws athena list-named-queries \
+                --work-group org-siem \
+                --region "$AWS_DEFAULT_REGION" \
+                --query "NamedQueryIds" \
+                --output text 2>/dev/null || echo "")
+            for QID in $QUERY_IDS; do
+              AWS_ACCESS_KEY_ID=$_AK AWS_SECRET_ACCESS_KEY=$_SK AWS_SESSION_TOKEN=$_ST \
+              aws athena delete-named-query \
+                --named-query-id "$QID" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+            echo "INFO: Cleared Athena named queries from org-siem workgroup."
+
+            unset _AK _SK _ST
+          fi
+
+          # VPC endpoints were already deleted above; remove from state so
+          # Terraform does not attempt a second delete and error out.
+          terraform state rm aws_vpc_endpoint.ssm 2>/dev/null || true
+          terraform state rm aws_vpc_endpoint.ssmmessages 2>/dev/null || true
+          terraform state rm aws_vpc_endpoint.ec2messages 2>/dev/null || true
+          terraform state rm aws_vpc_endpoint.s3 2>/dev/null || true
+
+          # Route53 Resolver query log configs create resolver ENIs in subnets.
+          # Remove from state and delete via CLI in the ENI step so the ENIs
+          # are released before Terraform destroy runs.
+          terraform state rm aws_route53_resolver_query_log_config_association.corporate 2>/dev/null || true
+          terraform state rm aws_route53_resolver_query_log_config.corporate 2>/dev/null || true
+          terraform state rm aws_route53_resolver_query_log_config_association.security 2>/dev/null || true
+          terraform state rm aws_route53_resolver_query_log_config.security 2>/dev/null || true
+        env:
+          TF_VAR_account_id:               ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_transit_gateway_id:       placeholder
+          TF_VAR_dns_firewall_rule_group_arn: placeholder
+          TF_VAR_networking_account_id:    ${{ steps.resolve.outputs.networking_account_id }}
+          TF_VAR_corporate_account_id:          ${{ steps.resolve.outputs.corporate_account_id }}
+          TF_VAR_siem_alert_email:               ""
+          TF_VAR_siem_schedule_enabled:          "false"
+          TF_VAR_org_logs_bucket_arn:            "arn:aws:s3:::org-logs-${{ steps.resolve.outputs.account_id }}-v2"
+
+      - name: Refresh AWS Credentials (pre-drain)
+        # Pre-drain credential refresh ensures the management OIDC session used
+        # by assume_security_role starts fresh. Without this, earlier steps can
+        # consume 30-60 minutes of the session before the drain even begins,
+        # causing ExpiredToken mid-drain when the management credentials roll over.
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:       arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name:    GitHubActions-Destroy-security
+          aws-region:           ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Empty and Delete org-logs Bucket
+        run: |
+          SECURITY_ID="${{ steps.resolve.outputs.account_id }}"
+          BUCKET="org-logs-${SECURITY_ID}-v2"
+
+          # Save management credentials so we can re-assume the security role
+          # periodically -- the security session also expires after 1 hour.
+          MGMT_KEY_ID="$AWS_ACCESS_KEY_ID"
+          MGMT_SECRET="$AWS_SECRET_ACCESS_KEY"
+          MGMT_TOKEN="$AWS_SESSION_TOKEN"
+
+          assume_security_role() {
+            local CREDS
+            CREDS=$(AWS_ACCESS_KEY_ID="$MGMT_KEY_ID" \
+                    AWS_SECRET_ACCESS_KEY="$MGMT_SECRET" \
+                    AWS_SESSION_TOKEN="$MGMT_TOKEN" \
+                    aws sts assume-role \
+                      --role-arn "arn:aws:iam::${SECURITY_ID}:role/OrganizationAccountAccessRole" \
+                      --role-session-name "GitHubActions-EmptyBucket" \
+                      --output json)
+            echo "::add-mask::$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')"
+            echo "::add-mask::$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')"
+            echo "::add-mask::$(echo "$CREDS" | jq -r '.Credentials.SessionToken')"
+            export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+            export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+            export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+          }
+
+          assume_security_role
+
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Bucket ${BUCKET} does not exist -- skipping drain."
+            exit 0
+          fi
+
+          echo "WARNING: Permanently deleting all audit logs in ${BUCKET}."
+          BUCKET="$BUCKET" python3 scripts/drain-s3-bucket.py
+
+          aws s3 rb "s3://${BUCKET}" --force 2>/dev/null || \
+            echo "Bucket ${BUCKET} already deleted or does not exist."
+
+      - name: Refresh AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:       arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name:    GitHubActions-Destroy-security
+          aws-region:           ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Preserve Corporate Domain Controller (security job)
+        if: ${{ inputs.preserve_domain_controllers == true }}
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.corporate_account_id }}"
+
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-PreserveDC-security" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=tag:Name,Values=corporate-dc01" \
+                      "Name=instance-state-name,Values=running,stopped" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "INFO: No DC instance found -- skipping AMI snapshot."
+          else
+            PREV_AMIS=$(aws ec2 describe-images \
+              --region "$AWS_DEFAULT_REGION" \
+              --owners self \
+              --filters "Name=tag:PreservedDC,Values=true" \
+                        "Name=tag:Account,Values=corporate" \
+              --query "Images[*].ImageId" \
+              --output text 2>/dev/null || echo "")
+            for OLD_AMI in $PREV_AMIS; do
+              [[ "$OLD_AMI" == "None" || -z "$OLD_AMI" ]] && continue
+              SNAPS=$(aws ec2 describe-images \
+                --region "$AWS_DEFAULT_REGION" \
+                --image-ids "$OLD_AMI" \
+                --query "Images[0].BlockDeviceMappings[*].Ebs.SnapshotId" \
+                --output text 2>/dev/null || echo "")
+              aws ec2 deregister-image --region "$AWS_DEFAULT_REGION" --image-id "$OLD_AMI" 2>/dev/null || true
+              echo "INFO: Deregistered previous preserved AMI: ${OLD_AMI}"
+              for SNAP in $SNAPS; do
+                [[ "$SNAP" == "None" || -z "$SNAP" ]] && continue
+                aws ec2 delete-snapshot --region "$AWS_DEFAULT_REGION" --snapshot-id "$SNAP" 2>/dev/null || true
+                echo "INFO: Deleted snapshot: ${SNAP}"
+              done
+            done
+
+            echo "INFO: Creating AMI snapshot of ${INSTANCE_ID} (no-reboot)..."
+            AMI_ID=$(aws ec2 create-image \
+              --region "$AWS_DEFAULT_REGION" \
+              --instance-id "$INSTANCE_ID" \
+              --name "corporate-dc01-preserve-$(date +%Y%m%d%H%M%S)" \
+              --description "Auto-snapshot before cleanup -- restore on redeploy" \
+              --no-reboot \
+              --tag-specifications "ResourceType=image,Tags=[{Key=PreservedDC,Value=true},{Key=Account,Value=corporate},{Key=ManagedBy,Value=Terraform-Cleanup}]" \
+              --query "ImageId" \
+              --output text)
+            echo "INFO: AMI created: ${AMI_ID}"
+            echo "::notice::Corporate DC AMI: ${AMI_ID} -- tagged PreservedDC=true; the next terraform-deploy run will auto-discover and restore it."
+
+            echo "INFO: Waiting for AMI to become available..."
+            AMI_WAIT=0
+            while [[ $AMI_WAIT -lt 2700 ]]; do
+              AMI_STATE=$(aws ec2 describe-images \
+                --region "$AWS_DEFAULT_REGION" \
+                --image-ids "$AMI_ID" \
+                --query "Images[0].State" \
+                --output text 2>/dev/null || echo "unknown")
+              if [[ "$AMI_STATE" == "available" ]]; then echo "INFO: AMI available."; break
+              elif [[ "$AMI_STATE" == "failed" ]]; then echo "::warning::AMI failed to create."; break; fi
+              echo "INFO: AMI state: ${AMI_STATE} -- waiting... (${AMI_WAIT}s elapsed)"
+              sleep 30
+              AMI_WAIT=$((AMI_WAIT + 30))
+            done
+            [[ $AMI_WAIT -ge 2700 ]] && echo "::warning::AMI wait timed out -- AMI may still be creating."
+
+            echo "INFO: Stopping instance ${INSTANCE_ID}..."
+            aws ec2 stop-instances --region "$AWS_DEFAULT_REGION" --instance-ids "$INSTANCE_ID"
+            aws ec2 wait instance-stopped --region "$AWS_DEFAULT_REGION" --instance-ids "$INSTANCE_ID" \
+              && echo "INFO: Instance stopped." || echo "::warning::Instance stop wait timed out."
+
+            echo "INFO: Terminating instance ${INSTANCE_ID} (AMI preserved)..."
+            aws ec2 terminate-instances --region "$AWS_DEFAULT_REGION" --instance-ids "$INSTANCE_ID"
+            aws ec2 wait instance-terminated --region "$AWS_DEFAULT_REGION" --instance-ids "$INSTANCE_ID" \
+              && echo "INFO: Instance terminated." || echo "::warning::Instance termination wait timed out."
+          fi
+
+      - name: Clean Up Remaining VPC Resources
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-VPCCleanup-security" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken')
+
+          VPC_IDS=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=isDefault,Values=false" \
+            --query "Vpcs[].VpcId" \
+            --output text 2>/dev/null || echo "")
+          if [ -z "$VPC_IDS" ] || [ "$VPC_IDS" = "None" ]; then
+            echo "No non-default VPCs found in security account -- nothing to pre-clean."
+            exit 0
+          fi
+          for VPC_ID in $VPC_IDS; do
+            echo "Cleaning up remaining resources in VPC: ${VPC_ID}"
+
+            # Terminate any remaining EC2 instances.
+            INSTANCE_IDS=$(aws ec2 describe-instances \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+                        "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+              --query "Reservations[].Instances[].InstanceId" \
+              --output text 2>/dev/null || echo "")
+            if [ -n "$INSTANCE_IDS" ] && [ "$INSTANCE_IDS" != "None" ]; then
+              echo "Terminating instances: ${INSTANCE_IDS}"
+              aws ec2 terminate-instances --region "$AWS_DEFAULT_REGION" --instance-ids $INSTANCE_IDS || true
+              aws ec2 wait instance-terminated --region "$AWS_DEFAULT_REGION" --instance-ids $INSTANCE_IDS || true
+            fi
+
+            # Delete VPC endpoints (interface endpoints hold ENIs that block subnet deletion).
+            ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+                        "Name=vpc-endpoint-state,Values=available,pending" \
+              --query "VpcEndpoints[].VpcEndpointId" \
+              --output text 2>/dev/null || echo "")
+            if [ -n "$ENDPOINT_IDS" ] && [ "$ENDPOINT_IDS" != "None" ]; then
+              echo "Deleting VPC endpoints: ${ENDPOINT_IDS}"
+              aws ec2 delete-vpc-endpoints --region "$AWS_DEFAULT_REGION" \
+                --vpc-endpoint-ids $ENDPOINT_IDS 2>/dev/null || true
+              for i in $(seq 1 24); do
+                REMAINING=$(aws ec2 describe-vpc-endpoints \
+                  --region "$AWS_DEFAULT_REGION" \
+                  --filters "Name=vpc-id,Values=${VPC_ID}" \
+                            "Name=vpc-endpoint-state,Values=available,pending,deleting" \
+                  --query "length(VpcEndpoints)" --output text 2>/dev/null || echo "0")
+                [ "$REMAINING" -eq "0" ] && echo "  Endpoints deleted." && break
+                echo "  Waiting for endpoint deletion (${i}/24)..."
+                sleep 10
+              done
+            fi
+
+            # Disassociate Route53 DNS Firewall rule group associations.
+            ASSOC_IDS=$(aws route53resolver list-firewall-rule-group-associations \
+              --region "$AWS_DEFAULT_REGION" \
+              --query "FirewallRuleGroupAssociations[?VpcId=='${VPC_ID}'].Id" \
+              --output text 2>/dev/null || echo "")
+            if [ -n "$ASSOC_IDS" ] && [ "$ASSOC_IDS" != "None" ]; then
+              for ASSOC_ID in $ASSOC_IDS; do
+                echo "Disassociating DNS Firewall rule group: ${ASSOC_ID}"
+                aws route53resolver disassociate-firewall-rule-group \
+                  --region "$AWS_DEFAULT_REGION" \
+                  --firewall-rule-group-association-id "$ASSOC_ID" 2>/dev/null || true
+              done
+            fi
+
+            # Delete Route 53 Resolver rule associations then outbound endpoints.
+            # Resolver endpoint ENIs sit inside private subnets and cause a
+            # DependencyViolation on subnet deletion if not removed first.
+            RULE_ASSOC_IDS=$(aws route53resolver list-resolver-rule-associations \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=VPCId,Values=${VPC_ID}" \
+              --query "ResolverRuleAssociations[?Status!='DELETING'].Id" \
+              --output text 2>/dev/null || echo "")
+            if [ -n "$RULE_ASSOC_IDS" ] && [ "$RULE_ASSOC_IDS" != "None" ]; then
+              for RULE_ASSOC_ID in $RULE_ASSOC_IDS; do
+                echo "Disassociating Resolver rule: ${RULE_ASSOC_ID}"
+                aws route53resolver disassociate-resolver-rule \
+                  --region "$AWS_DEFAULT_REGION" \
+                  --resolver-rule-association-id "$RULE_ASSOC_ID" 2>/dev/null || true
+              done
+            fi
+            RESOLVER_EP_IDS=$(aws route53resolver list-resolver-endpoints \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=HOST_VPC_ID,Values=${VPC_ID}" \
+              --query "ResolverEndpoints[?Status!='DELETING'].Id" \
+              --output text 2>/dev/null || echo "")
+            if [ -n "$RESOLVER_EP_IDS" ] && [ "$RESOLVER_EP_IDS" != "None" ]; then
+              for EP_ID in $RESOLVER_EP_IDS; do
+                echo "Deleting Resolver endpoint: ${EP_ID}"
+                aws route53resolver delete-resolver-endpoint \
+                  --region "$AWS_DEFAULT_REGION" \
+                  --resolver-endpoint-id "$EP_ID" 2>/dev/null || true
+              done
+              echo "Waiting 60s for Resolver endpoint ENIs to release..."
+              sleep 60
+            fi
+
+            # Delete all subnets in the VPC.
+            SUBNET_IDS=$(aws ec2 describe-subnets \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query "Subnets[].SubnetId" \
+              --output text 2>/dev/null || echo "")
+            if [ -n "$SUBNET_IDS" ] && [ "$SUBNET_IDS" != "None" ]; then
+              for SUBNET_ID in $SUBNET_IDS; do
+                echo "Deleting subnet: ${SUBNET_ID}"
+                aws ec2 delete-subnet --region "$AWS_DEFAULT_REGION" --subnet-id "$SUBNET_ID" 2>/dev/null || true
+              done
+            fi
+
+            # Delete all non-main route tables in the VPC.
+            ALL_RTS=$(aws ec2 describe-route-tables \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query "RouteTables[].RouteTableId" --output text 2>/dev/null || echo "")
+            MAIN_RT=$(aws ec2 describe-route-tables \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" "Name=association.main,Values=true" \
+              --query "RouteTables[0].RouteTableId" --output text 2>/dev/null || echo "")
+            for RT_ID in $ALL_RTS; do
+              if [ "$RT_ID" != "$MAIN_RT" ] && [ -n "$RT_ID" ] && [ "$RT_ID" != "None" ]; then
+                echo "Deleting route table: ${RT_ID}"
+                aws ec2 delete-route-table --region "$AWS_DEFAULT_REGION" --route-table-id "$RT_ID" 2>/dev/null || true
+              fi
+            done
+          done
+
+          echo "VPC pre-destroy cleanup complete."
+
+      - name: Refresh AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:       arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name:    GitHubActions-Destroy-security
+          aws-region:           ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Terraform Destroy
+        working-directory: terraform/security
+        run: terraform destroy -auto-approve -no-color
+        env:
+          TF_VAR_account_id:               ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_transit_gateway_id:       placeholder
+          TF_VAR_dns_firewall_rule_group_arn: placeholder
+          TF_VAR_networking_account_id:    ${{ steps.resolve.outputs.networking_account_id }}
+          TF_VAR_corporate_account_id:          ${{ steps.resolve.outputs.corporate_account_id }}
+          TF_VAR_siem_alert_email:               ""
+          TF_VAR_siem_schedule_enabled:          "false"
+          TF_VAR_org_logs_bucket_arn:            "arn:aws:s3:::org-logs-${{ steps.resolve.outputs.account_id }}-v2"
+
+  # --------------------------------------------------------------------------
+  # Job 2 - Destroy Corporate
+  # --------------------------------------------------------------------------
+  destroy-corporate:
+    name: Destroy - corporate
+    runs-on: ubuntu-latest
+    environment: management
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:       arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name:    GitHubActions-Destroy-corporate
+          aws-region:           ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Resolve Account IDs
+        id: resolve
+        run: |
+          CORPORATE_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='corporate-main-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          NETWORKING_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='networking-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          SECURITY_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='security-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          echo "account_id=${CORPORATE_ID}"             >> "$GITHUB_OUTPUT"
+          echo "networking_account_id=${NETWORKING_ID}" >> "$GITHUB_OUTPUT"
+          echo "security_account_id=${SECURITY_ID}"     >> "$GITHUB_OUTPUT"
+          echo "TF_VAR_account_id=${CORPORATE_ID}"      >> "$GITHUB_ENV"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform/corporate
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=corporate/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Release Stale State Lock
+        run: |
+          BUCKET="${{ secrets.TFSTATE_BUCKET_NAME }}"
+          KEY="corporate/terraform.tfstate.lock.info"
+          BATCH=$(aws s3api list-object-versions \
+            --bucket "$BUCKET" --prefix "$KEY" --output json 2>/dev/null || echo '{}')
+          OBJECTS=$(echo "$BATCH" | jq -c '{
+            Objects: (
+              [(.Versions // [])[] | {Key:.Key, VersionId:.VersionId}] +
+              [(.DeleteMarkers // [])[] | {Key:.Key, VersionId:.VersionId}]
+            )
+          }')
+          COUNT=$(echo "$OBJECTS" | jq '.Objects | length')
+          if [[ "$COUNT" -gt "0" ]]; then
+            echo "Clearing ${COUNT} stale lock file version(s)..."
+            aws s3api delete-objects --bucket "$BUCKET" --delete "$OBJECTS" 2>/dev/null && \
+              echo "Lock cleared." || echo "Warning: could not clear all lock versions."
+          else
+            echo "No stale lock file found."
+          fi
+
+      - name: Delete Orphaned VPCs
+        # Previous failed deploys can leave behind VPCs that are not in
+        # Terraform state. These block clean redeployment and must be
+        # removed before the main destroy runs. The current VPC (tagged
+        # with Name=security-vpc or Name=corporate-vpc) is identified and
+        # preserved -- all others are deleted.
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteOrphanVPCs" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          # Get all non-default VPCs
+          ALL_VPCS=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=isDefault,Values=false" \
+            --query "Vpcs[].VpcId" \
+            --output text 2>/dev/null || echo "")
+
+          for VPC_ID in $ALL_VPCS; do
+            # Check if this VPC has any remaining dependencies before deleting
+            SUBNETS=$(aws ec2 describe-subnets \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query "Subnets[].SubnetId" --output text 2>/dev/null || echo "")
+            for SUBNET in $SUBNETS; do
+              aws ec2 delete-subnet --subnet-id "$SUBNET" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+
+            IGW_IDS=$(aws ec2 describe-internet-gateways \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=attachment.vpc-id,Values=${VPC_ID}" \
+              --query "InternetGateways[].InternetGatewayId" --output text 2>/dev/null || echo "")
+            for IGW in $IGW_IDS; do
+              aws ec2 detach-internet-gateway --internet-gateway-id "$IGW" \
+                --vpc-id "$VPC_ID" --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+              aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+
+            RTS=$(aws ec2 describe-route-tables \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query "RouteTables[?Associations[0].Main!=\`true\`].RouteTableId" \
+              --output text 2>/dev/null || echo "")
+            for RT in $RTS; do
+              aws ec2 delete-route-table --route-table-id "$RT" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+
+            SG_IDS=$(aws ec2 describe-security-groups \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query "SecurityGroups[?GroupName!='default'].GroupId" \
+              --output text 2>/dev/null || echo "")
+            for SG in $SG_IDS; do
+              aws ec2 delete-security-group --group-id "$SG" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+
+            echo "Deleting orphaned VPC: ${VPC_ID}"
+            aws ec2 delete-vpc --vpc-id "$VPC_ID" \
+              --region "$AWS_DEFAULT_REGION" 2>/dev/null && \
+              echo "  Deleted: ${VPC_ID}" || \
+              echo "  Could not delete ${VPC_ID} -- may still have dependencies."
+          done
+
+      - name: Delete Resolver Query Log Configs and Interface VPC Endpoints
+        # Route53 Resolver query log configs and interface VPC endpoints both
+        # create ENIs in the private subnet. Both must be explicitly deleted
+        # via CLI before Terraform destroy runs.
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteEndpoints-corporate" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          # Delete Route53 Resolver query log config for corporate VPC first.
+          CORP_VPC_ID=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=tag:Name,Values=corporate-vpc" \
+            --query "Vpcs[0].VpcId" --output text 2>/dev/null || echo "")
+
+          if [ -n "$CORP_VPC_ID" ] && [ "$CORP_VPC_ID" != "None" ]; then
+            CONFIG_IDS=$(aws route53resolver list-resolver-query-log-configs \
+              --region "$AWS_DEFAULT_REGION" \
+              --query "ResolverQueryLogConfigs[?Name=='corporate-vpc-dns-query-logs'].Id" \
+              --output text 2>/dev/null || echo "")
+            for CONFIG_ID in $CONFIG_IDS; do
+              echo "Deleting corporate Route53 query log config: ${CONFIG_ID}"
+              aws route53resolver delete-resolver-query-log-config \
+                --region "$AWS_DEFAULT_REGION" \
+                --resolver-query-log-config-id "$CONFIG_ID" 2>/dev/null || true
+            done
+            [ -n "$CONFIG_IDS" ] && sleep 30 || true
+          fi
+
+          ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=vpc-endpoint-type,Values=Interface" \
+                      "Name=vpc-endpoint-state,Values=available,pending,pending-acceptance" \
+            --query "VpcEndpoints[*].VpcEndpointId" \
+            --output text)
+
+          if [ -z "$ENDPOINT_IDS" ] || [ "$ENDPOINT_IDS" = "None" ]; then
+            echo "No interface endpoints found. Nothing to delete."
+          else
+            echo "Deleting endpoints: ${ENDPOINT_IDS}"
+            aws ec2 delete-vpc-endpoints \
+              --region "$AWS_DEFAULT_REGION" \
+              --vpc-endpoint-ids ${ENDPOINT_IDS}
+          fi
+
+          echo "Waiting for endpoints to reach deleted state (up to 10 minutes)..."
+          for i in $(seq 1 60); do
+            PENDING=$(aws ec2 describe-vpc-endpoints \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-endpoint-type,Values=Interface" \
+                        "Name=vpc-endpoint-state,Values=deleting,available,pending" \
+              --query "length(VpcEndpoints)" \
+              --output text)
+            [ "$PENDING" -eq "0" ] && echo "All endpoints deleted." && break
+            echo "Still waiting -- ${PENDING} endpoint(s) in progress. (${i}/60)"
+            sleep 10
+          done
+
+      - name: Delete Orphaned Network Interfaces
+        # After endpoint deletion the backing ENIs can linger for several
+        # minutes. This step polls until all endpoint-type ENIs in the
+        # security VPC are gone before Terraform destroy runs.
+        # Scoped to the corporate VPC by tag to avoid touching other accounts.
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteOrphanedENIs-corporate" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          # Resolve the security VPC ID to scope ENI lookups
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=tag:Name,Values=corporate-vpc" \
+            --query "Vpcs[0].VpcId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "Corporate VPC not found -- nothing to clean up."
+            exit 0
+          fi
+
+          echo "Cleaning up ENIs in VPC: ${VPC_ID}"
+
+          # Pass 1: delete available ENIs in the VPC
+          AVAILABLE_ENIS=$(aws ec2 describe-network-interfaces \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=vpc-id,Values=${VPC_ID}" "Name=status,Values=available" \
+            --query "NetworkInterfaces[*].NetworkInterfaceId" \
+            --output text)
+
+          if [ -z "$AVAILABLE_ENIS" ] || [ "$AVAILABLE_ENIS" = "None" ]; then
+            echo "No available ENIs found in VPC."
+          else
+            for ENI_ID in $AVAILABLE_ENIS; do
+              echo "Deleting available ENI: ${ENI_ID}"
+              aws ec2 delete-network-interface \
+                --region "$AWS_DEFAULT_REGION" \
+                --network-interface-id "$ENI_ID" || \
+                echo "WARNING: Could not delete ${ENI_ID} -- skipping."
+            done
+          fi
+
+          # Pass 2: poll until all vpc_endpoint-type ENIs in the VPC are gone.
+          # AWS releases these asynchronously after endpoint deletion -- polling
+          # is the only reliable approach. 30 iterations x 20s = 10 min max.
+          echo "Polling for vpc_endpoint ENIs in VPC ${VPC_ID} (up to 10 minutes)..."
+          for i in $(seq 1 30); do
+            ENDPOINT_ENIS=$(aws ec2 describe-network-interfaces \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+                        "Name=interface-type,Values=vpc_endpoint" \
+              --query "NetworkInterfaces[*].NetworkInterfaceId" \
+              --output text)
+
+            if [ -z "$ENDPOINT_ENIS" ] || [ "$ENDPOINT_ENIS" = "None" ]; then
+              echo "All endpoint ENIs released. Safe to proceed with destroy."
+              exit 0
+            fi
+
+            echo "Pass ${i}/30 -- endpoint ENIs still present: ${ENDPOINT_ENIS}"
+            # Attempt deletion on each pass -- AWS will allow it once released
+            for ENI_ID in $ENDPOINT_ENIS; do
+              aws ec2 delete-network-interface \
+                --region "$AWS_DEFAULT_REGION" \
+                --network-interface-id "$ENI_ID" 2>/dev/null && \
+                echo "Deleted: ${ENI_ID}" || true
+            done
+            sleep 20
+          done
+
+          echo "::warning::Some endpoint ENIs may still be present -- destroy may encounter DependencyViolation on first attempt."
+          exit 0
+
+      - name: Delete Non-Default Security Groups
+        # Deletes all non-default security groups in the corporate VPC before
+        # Terraform destroy runs. Non-default SGs block VPC deletion if they
+        # still exist when Terraform attempts to delete the VPC.
+        # The default SG cannot be deleted and does not block VPC deletion.
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteSGs-corporate" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=tag:Name,Values=corporate-vpc" \
+            --query "Vpcs[0].VpcId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "INFO: Corporate VPC not found -- nothing to clean up."
+            exit 0
+          fi
+
+          SG_IDS=$(aws ec2 describe-security-groups \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=vpc-id,Values=${VPC_ID}" \
+            --query "SecurityGroups[?GroupName!='default'].GroupId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$SG_IDS" ] || [ "$SG_IDS" = "None" ]; then
+            echo "INFO: No non-default security groups found in ${VPC_ID}."
+            exit 0
+          fi
+
+          # Revoke all inbound and outbound rules before deleting. Cross-SG
+          # references cause DependencyViolation when deleting individually.
+          for SG_ID in $SG_IDS; do
+            echo "Revoking rules from: ${SG_ID}"
+            INGRESS=$(aws ec2 describe-security-groups \
+              --region "$AWS_DEFAULT_REGION" --group-ids "$SG_ID" \
+              --query "SecurityGroups[0].IpPermissions" \
+              --output json 2>/dev/null || echo "[]")
+            if [[ "$INGRESS" != "[]" && "$INGRESS" != "null" && -n "$INGRESS" ]]; then
+              aws ec2 revoke-security-group-ingress \
+                --region "$AWS_DEFAULT_REGION" --group-id "$SG_ID" \
+                --ip-permissions "$INGRESS" 2>/dev/null || true
+            fi
+            EGRESS=$(aws ec2 describe-security-groups \
+              --region "$AWS_DEFAULT_REGION" --group-ids "$SG_ID" \
+              --query "SecurityGroups[0].IpPermissionsEgress" \
+              --output json 2>/dev/null || echo "[]")
+            if [[ "$EGRESS" != "[]" && "$EGRESS" != "null" && -n "$EGRESS" ]]; then
+              aws ec2 revoke-security-group-egress \
+                --region "$AWS_DEFAULT_REGION" --group-id "$SG_ID" \
+                --ip-permissions "$EGRESS" 2>/dev/null || true
+            fi
+          done
+
+          for SG_ID in $SG_IDS; do
+            echo "Deleting security group: ${SG_ID}"
+            aws ec2 delete-security-group \
+              --region "$AWS_DEFAULT_REGION" \
+              --group-id "$SG_ID" 2>/dev/null && \
+              echo "  Deleted: ${SG_ID}" || \
+              echo "  WARNING: Could not delete ${SG_ID} -- skipping."
+          done
+
+      - name: Delete Transit Gateway VPC Attachment
+        # The TGW VPC attachment creates ENIs in the private subnet that stay
+        # in-use state until the attachment is fully deleted. Terraform destroy
+        # cannot delete the subnet or VPC while those ENIs remain, producing a
+        # DependencyViolation after its 20-minute timeout. Deleting the attachment
+        # here and polling until gone ensures the ENIs are released before destroy.
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteTGWAttach-corporate" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=tag:Name,Values=corporate-vpc" \
+            --query "Vpcs[0].VpcId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "Corporate VPC not found -- skipping TGW attachment cleanup."
+            exit 0
+          fi
+
+          ATTACH_IDS=$(aws ec2 describe-transit-gateway-vpc-attachments \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=vpc-id,Values=${VPC_ID}" \
+                      "Name=state,Values=available,modifying,pending" \
+            --query "TransitGatewayVpcAttachments[].TransitGatewayAttachmentId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$ATTACH_IDS" ] || [ "$ATTACH_IDS" = "None" ]; then
+            echo "No active TGW VPC attachments found for ${VPC_ID}."
+            exit 0
+          fi
+
+          for ATTACH_ID in $ATTACH_IDS; do
+            echo "Deleting TGW VPC attachment: ${ATTACH_ID}"
+            aws ec2 delete-transit-gateway-vpc-attachment \
+              --transit-gateway-attachment-id "$ATTACH_ID" \
+              --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+          done
+
+          echo "Polling until TGW attachments are deleted (releases ENIs, up to 5 min)..."
+          for i in $(seq 1 30); do
+            REMAINING=$(aws ec2 describe-transit-gateway-vpc-attachments \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+                        "Name=state,Values=available,modifying,pending,deleting" \
+              --query "length(TransitGatewayVpcAttachments)" \
+              --output text 2>/dev/null || echo "0")
+            echo "  Attachments still active: ${REMAINING} (check ${i}/30)"
+            [ "$REMAINING" -eq "0" ] && echo "  All TGW attachments deleted." && break
+            sleep 10
+          done
+
+      - name: Remove Protected Resources from Terraform State
+        # Removes SCP-protected and dependency-causing resources from state
+        # before destroy so Terraform does not attempt to delete them.
+        working-directory: terraform/corporate
+        run: |
+          # Config resources - config:StopConfigurationRecorder blocked by SCP
+          terraform state rm aws_config_configuration_recorder.main 2>/dev/null || true
+          terraform state rm aws_config_delivery_channel.main 2>/dev/null || true
+          terraform state rm aws_config_configuration_recorder_status.main 2>/dev/null || true
+          terraform state rm aws_iam_service_linked_role.config 2>/dev/null || true
+
+          # VPC endpoints were already deleted above; remove from state so
+          # Terraform does not attempt a second delete and error out.
+          terraform state rm aws_vpc_endpoint.ssm 2>/dev/null || true
+          terraform state rm aws_vpc_endpoint.ssmmessages 2>/dev/null || true
+          terraform state rm aws_vpc_endpoint.ec2messages 2>/dev/null || true
+          terraform state rm aws_vpc_endpoint.s3 2>/dev/null || true
+
+          # TGW attachment was already deleted by the explicit Delete TGW step.
+          # Remove from state to prevent Terraform from attempting a second delete.
+          terraform state rm aws_ec2_transit_gateway_vpc_attachment.main 2>/dev/null || true
+        env:
+          TF_VAR_account_id:               ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_transit_gateway_id:       placeholder
+          TF_VAR_networking_account_id:    ${{ steps.resolve.outputs.networking_account_id }}
+          TF_VAR_security_account_id:      ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_on_prem_wan_ip:           ${{ secrets.TF_VAR_ON_PREM_WAN_IP }}
+          TF_VAR_dns_firewall_rule_group_arn: placeholder
+          TF_VAR_org_logs_bucket_arn:      "arn:aws:s3:::org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+
+      - name: Remove DC Instance from Terraform State
+        if: ${{ inputs.preserve_domain_controllers == true }}
+        working-directory: terraform/corporate
+        run: |
+          # The DC instance was already terminated by the security job's preserve step.
+          # Remove it from state so Terraform destroy does not attempt a second delete.
+          terraform state rm aws_instance.dc 2>/dev/null || true
+        env:
+          TF_VAR_account_id:               ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_transit_gateway_id:       placeholder
+          TF_VAR_networking_account_id:    ${{ steps.resolve.outputs.networking_account_id }}
+          TF_VAR_security_account_id:      ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_on_prem_wan_ip:           ${{ secrets.TF_VAR_ON_PREM_WAN_IP }}
+          TF_VAR_dns_firewall_rule_group_arn: placeholder
+          TF_VAR_org_logs_bucket_arn:      "arn:aws:s3:::org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+
+      - name: Clean Up Remaining VPC Resources
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-VPCCleanup-corporate" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken')
+
+          VPC_IDS=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=isDefault,Values=false" \
+            --query "Vpcs[].VpcId" \
+            --output text 2>/dev/null || echo "")
+          if [ -z "$VPC_IDS" ] || [ "$VPC_IDS" = "None" ]; then
+            echo "No non-default VPCs found in corporate account -- nothing to pre-clean."
+            exit 0
+          fi
+          for VPC_ID in $VPC_IDS; do
+            echo "Cleaning up remaining resources in VPC: ${VPC_ID}"
+
+            # Terminate any remaining EC2 instances.
+            INSTANCE_IDS=$(aws ec2 describe-instances \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+                        "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+              --query "Reservations[].Instances[].InstanceId" \
+              --output text 2>/dev/null || echo "")
+            if [ -n "$INSTANCE_IDS" ] && [ "$INSTANCE_IDS" != "None" ]; then
+              echo "Terminating instances: ${INSTANCE_IDS}"
+              aws ec2 terminate-instances --region "$AWS_DEFAULT_REGION" --instance-ids $INSTANCE_IDS || true
+              aws ec2 wait instance-terminated --region "$AWS_DEFAULT_REGION" --instance-ids $INSTANCE_IDS || true
+            fi
+
+            # Delete VPC endpoints (interface endpoints hold ENIs that block subnet deletion).
+            ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+                        "Name=vpc-endpoint-state,Values=available,pending" \
+              --query "VpcEndpoints[].VpcEndpointId" \
+              --output text 2>/dev/null || echo "")
+            if [ -n "$ENDPOINT_IDS" ] && [ "$ENDPOINT_IDS" != "None" ]; then
+              echo "Deleting VPC endpoints: ${ENDPOINT_IDS}"
+              aws ec2 delete-vpc-endpoints --region "$AWS_DEFAULT_REGION" \
+                --vpc-endpoint-ids $ENDPOINT_IDS 2>/dev/null || true
+              for i in $(seq 1 24); do
+                REMAINING=$(aws ec2 describe-vpc-endpoints \
+                  --region "$AWS_DEFAULT_REGION" \
+                  --filters "Name=vpc-id,Values=${VPC_ID}" \
+                            "Name=vpc-endpoint-state,Values=available,pending,deleting" \
+                  --query "length(VpcEndpoints)" --output text 2>/dev/null || echo "0")
+                [ "$REMAINING" -eq "0" ] && echo "  Endpoints deleted." && break
+                echo "  Waiting for endpoint deletion (${i}/24)..."
+                sleep 10
+              done
+            fi
+
+            # Disassociate Route53 DNS Firewall rule group associations.
+            ASSOC_IDS=$(aws route53resolver list-firewall-rule-group-associations \
+              --region "$AWS_DEFAULT_REGION" \
+              --query "FirewallRuleGroupAssociations[?VpcId=='${VPC_ID}'].Id" \
+              --output text 2>/dev/null || echo "")
+            if [ -n "$ASSOC_IDS" ] && [ "$ASSOC_IDS" != "None" ]; then
+              for ASSOC_ID in $ASSOC_IDS; do
+                echo "Disassociating DNS Firewall rule group: ${ASSOC_ID}"
+                aws route53resolver disassociate-firewall-rule-group \
+                  --region "$AWS_DEFAULT_REGION" \
+                  --firewall-rule-group-association-id "$ASSOC_ID" 2>/dev/null || true
+              done
+            fi
+
+            # Delete Route 53 Resolver rule associations then outbound endpoints.
+            # Resolver endpoint ENIs sit inside private subnets and cause a
+            # DependencyViolation on subnet deletion if not removed first.
+            RULE_ASSOC_IDS=$(aws route53resolver list-resolver-rule-associations \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=VPCId,Values=${VPC_ID}" \
+              --query "ResolverRuleAssociations[?Status!='DELETING'].Id" \
+              --output text 2>/dev/null || echo "")
+            if [ -n "$RULE_ASSOC_IDS" ] && [ "$RULE_ASSOC_IDS" != "None" ]; then
+              for RULE_ASSOC_ID in $RULE_ASSOC_IDS; do
+                echo "Disassociating Resolver rule: ${RULE_ASSOC_ID}"
+                aws route53resolver disassociate-resolver-rule \
+                  --region "$AWS_DEFAULT_REGION" \
+                  --resolver-rule-association-id "$RULE_ASSOC_ID" 2>/dev/null || true
+              done
+            fi
+            RESOLVER_EP_IDS=$(aws route53resolver list-resolver-endpoints \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=HOST_VPC_ID,Values=${VPC_ID}" \
+              --query "ResolverEndpoints[?Status!='DELETING'].Id" \
+              --output text 2>/dev/null || echo "")
+            if [ -n "$RESOLVER_EP_IDS" ] && [ "$RESOLVER_EP_IDS" != "None" ]; then
+              for EP_ID in $RESOLVER_EP_IDS; do
+                echo "Deleting Resolver endpoint: ${EP_ID}"
+                aws route53resolver delete-resolver-endpoint \
+                  --region "$AWS_DEFAULT_REGION" \
+                  --resolver-endpoint-id "$EP_ID" 2>/dev/null || true
+              done
+              echo "Waiting 60s for Resolver endpoint ENIs to release..."
+              sleep 60
+            fi
+
+            # Delete all subnets in the VPC.
+            SUBNET_IDS=$(aws ec2 describe-subnets \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query "Subnets[].SubnetId" \
+              --output text 2>/dev/null || echo "")
+            if [ -n "$SUBNET_IDS" ] && [ "$SUBNET_IDS" != "None" ]; then
+              for SUBNET_ID in $SUBNET_IDS; do
+                echo "Deleting subnet: ${SUBNET_ID}"
+                aws ec2 delete-subnet --region "$AWS_DEFAULT_REGION" --subnet-id "$SUBNET_ID" 2>/dev/null || true
+              done
+            fi
+
+            # Delete all non-main route tables in the VPC.
+            ALL_RTS=$(aws ec2 describe-route-tables \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query "RouteTables[].RouteTableId" --output text 2>/dev/null || echo "")
+            MAIN_RT=$(aws ec2 describe-route-tables \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" "Name=association.main,Values=true" \
+              --query "RouteTables[0].RouteTableId" --output text 2>/dev/null || echo "")
+            for RT_ID in $ALL_RTS; do
+              if [ "$RT_ID" != "$MAIN_RT" ] && [ -n "$RT_ID" ] && [ "$RT_ID" != "None" ]; then
+                echo "Deleting route table: ${RT_ID}"
+                aws ec2 delete-route-table --region "$AWS_DEFAULT_REGION" --route-table-id "$RT_ID" 2>/dev/null || true
+              fi
+            done
+          done
+
+          echo "VPC pre-destroy cleanup complete."
+
+      - name: Refresh AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:       arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name:    GitHubActions-Destroy-corporate
+          aws-region:           ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Terraform Destroy
+        working-directory: terraform/corporate
+        run: terraform destroy -auto-approve -no-color
+        env:
+          TF_VAR_account_id:               ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_transit_gateway_id:       placeholder
+          TF_VAR_networking_account_id:    ${{ steps.resolve.outputs.networking_account_id }}
+          TF_VAR_security_account_id:      ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_on_prem_wan_ip:           ${{ secrets.TF_VAR_ON_PREM_WAN_IP }}
+          TF_VAR_dns_firewall_rule_group_arn: placeholder
+          TF_VAR_org_logs_bucket_arn:      "arn:aws:s3:::org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+
+  # --------------------------------------------------------------------------
+  # Job 3 - Destroy Web
+  # Runs in parallel with destroy-security and destroy-corporate.
+  # Must complete before destroy-networking because the web account hosts the
+  # VPC Endpoint Service (PrivateLink producer). Destroying it first ensures
+  # the networking consumer VPC endpoint can be cleanly removed.
+  # --------------------------------------------------------------------------
+  destroy-web:
+    name: Destroy - web
+    runs-on: ubuntu-latest
+    environment: management
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:       arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name:    GitHubActions-Destroy-web
+          aws-region:           ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Resolve Account IDs
+        id: resolve
+        run: |
+          WEB_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='web-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          NETWORKING_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='networking-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          SECURITY_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='security-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          echo "account_id=${WEB_ID}"                   >> "$GITHUB_OUTPUT"
+          echo "networking_account_id=${NETWORKING_ID}" >> "$GITHUB_OUTPUT"
+          echo "security_account_id=${SECURITY_ID}"     >> "$GITHUB_OUTPUT"
+          echo "TF_VAR_account_id=${WEB_ID}"            >> "$GITHUB_ENV"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform/web
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=web/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Release Stale State Lock
+        run: |
+          BUCKET="${{ secrets.TFSTATE_BUCKET_NAME }}"
+          KEY="web/terraform.tfstate.lock.info"
+          BATCH=$(aws s3api list-object-versions \
+            --bucket "$BUCKET" --prefix "$KEY" --output json 2>/dev/null || echo '{}')
+          OBJECTS=$(echo "$BATCH" | jq -c '{
+            Objects: (
+              [(.Versions // [])[] | {Key:.Key, VersionId:.VersionId}] +
+              [(.DeleteMarkers // [])[] | {Key:.Key, VersionId:.VersionId}]
+            )
+          }')
+          COUNT=$(echo "$OBJECTS" | jq '.Objects | length')
+          if [[ "$COUNT" -gt "0" ]]; then
+            echo "Clearing ${COUNT} stale lock file version(s)..."
+            aws s3api delete-objects --bucket "$BUCKET" --delete "$OBJECTS" 2>/dev/null && \
+              echo "Lock cleared." || echo "Warning: could not clear all lock versions."
+          else
+            echo "No stale lock file found."
+          fi
+
+      - name: Delete SSM Interface VPC Endpoints
+        # SSM interface endpoints create ENIs in private subnets. Deleting them
+        # via CLI before Terraform destroy prevents DependencyViolation errors
+        # during subnet deletion.
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteEndpoints-web" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=vpc-endpoint-type,Values=Interface" \
+                      "Name=vpc-endpoint-state,Values=available,pending,pending-acceptance" \
+            --query "VpcEndpoints[*].VpcEndpointId" \
+            --output text)
+
+          if [ -z "$ENDPOINT_IDS" ] || [ "$ENDPOINT_IDS" = "None" ]; then
+            echo "No interface endpoints found. Nothing to delete."
+          else
+            echo "Deleting endpoints: ${ENDPOINT_IDS}"
+            aws ec2 delete-vpc-endpoints \
+              --region "$AWS_DEFAULT_REGION" \
+              --vpc-endpoint-ids ${ENDPOINT_IDS}
+
+            echo "Waiting for endpoints to reach deleted state (up to 5 minutes)..."
+            for i in $(seq 1 30); do
+              PENDING=$(aws ec2 describe-vpc-endpoints \
+                --region "$AWS_DEFAULT_REGION" \
+                --filters "Name=vpc-endpoint-type,Values=Interface" \
+                          "Name=vpc-endpoint-state,Values=deleting,available,pending" \
+                --query "length(VpcEndpoints)" \
+                --output text)
+              [ "$PENDING" -eq "0" ] && echo "All endpoints deleted." && break
+              echo "Still waiting -- ${PENDING} endpoint(s) in progress. (${i}/30)"
+              sleep 10
+            done
+          fi
+
+      - name: Delete Transit Gateway VPC Attachment
+        # The TGW attachment holds ENIs in the TGW subnet. Deleting it before
+        # Terraform destroy ensures subnets can be removed without a timeout.
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteTGWAttach-web" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=tag:Name,Values=web-vpc" \
+            --query "Vpcs[0].VpcId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "Web VPC not found -- skipping TGW attachment cleanup."
+            exit 0
+          fi
+
+          ATTACH_IDS=$(aws ec2 describe-transit-gateway-vpc-attachments \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=vpc-id,Values=${VPC_ID}" \
+                      "Name=state,Values=available,modifying,pending" \
+            --query "TransitGatewayVpcAttachments[].TransitGatewayAttachmentId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$ATTACH_IDS" ] || [ "$ATTACH_IDS" = "None" ]; then
+            echo "No active TGW VPC attachments found for ${VPC_ID}."
+            exit 0
+          fi
+
+          for ATTACH_ID in $ATTACH_IDS; do
+            echo "Deleting TGW VPC attachment: ${ATTACH_ID}"
+            aws ec2 delete-transit-gateway-vpc-attachment \
+              --transit-gateway-attachment-id "$ATTACH_ID" \
+              --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+          done
+
+          echo "Polling until TGW attachments are deleted (up to 5 min)..."
+          for i in $(seq 1 30); do
+            REMAINING=$(aws ec2 describe-transit-gateway-vpc-attachments \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+                        "Name=state,Values=available,modifying,pending,deleting" \
+              --query "length(TransitGatewayVpcAttachments)" \
+              --output text 2>/dev/null || echo "0")
+            echo "  Attachments still active: ${REMAINING} (check ${i}/30)"
+            [ "$REMAINING" -eq "0" ] && echo "  All TGW attachments deleted." && break
+            sleep 10
+          done
+
+      - name: Disassociate DNS Firewall Rule Group
+        # The DNS Firewall rule group association must be removed before Terraform
+        # can destroy the VPC. The rule group itself is owned by the networking
+        # account (shared via RAM) and is not destroyed here.
+        run: |
+          ACCOUNT_ID="${{ steps.resolve.outputs.account_id }}"
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DNSFirewall-web" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=tag:Name,Values=web-vpc" \
+            --query "Vpcs[0].VpcId" --output text 2>/dev/null || echo "")
+
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "Web VPC not found -- skipping DNS Firewall disassociation."
+            exit 0
+          fi
+
+          ASSOC_IDS=$(aws route53resolver list-firewall-rule-group-associations \
+            --region "$AWS_DEFAULT_REGION" \
+            --query "FirewallRuleGroupAssociations[?VpcId=='${VPC_ID}'].Id" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$ASSOC_IDS" ] || [ "$ASSOC_IDS" = "None" ]; then
+            echo "No DNS Firewall associations found for web VPC."
+            exit 0
+          fi
+
+          for ASSOC_ID in $ASSOC_IDS; do
+            echo "Disassociating DNS Firewall rule group: ${ASSOC_ID}"
+            aws route53resolver disassociate-firewall-rule-group \
+              --region "$AWS_DEFAULT_REGION" \
+              --firewall-rule-group-association-id "$ASSOC_ID" 2>/dev/null || true
+          done
+
+      - name: Delete Networking Consumer VPC Endpoint
+        # The networking account hosts a consumer VPC endpoint connected to the
+        # web VPC Endpoint Service. The endpoint service cannot be deleted while
+        # active connections exist, so we must delete the consumer endpoint first.
+        run: |
+          NET_ID="${{ steps.resolve.outputs.networking_account_id }}"
+          NET_CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${NET_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteWebConsumerEndpoint" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$NET_CREDS"     | jq -r '.Credentials.SessionToken')
+
+          # Consumer endpoints for PrivateLink services have service names
+          # matching com.amazonaws.vpce.* (distinct from AWS-managed services).
+          ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=vpc-endpoint-type,Values=Interface" \
+                      "Name=vpc-endpoint-state,Values=available,pending,pending-acceptance" \
+            --query "VpcEndpoints[?contains(ServiceName,'vpce-svc-')].VpcEndpointId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$ENDPOINT_IDS" ] || [ "$ENDPOINT_IDS" = "None" ]; then
+            echo "No web consumer endpoint found in networking account -- skipping."
+            exit 0
+          fi
+
+          echo "Deleting consumer endpoint(s): ${ENDPOINT_IDS}"
+          aws ec2 delete-vpc-endpoints \
+            --region "$AWS_DEFAULT_REGION" \
+            --vpc-endpoint-ids ${ENDPOINT_IDS} 2>/dev/null || true
+
+          echo "Waiting for consumer endpoint(s) to reach deleted state (up to 3 min)..."
+          for i in $(seq 1 18); do
+            REMAINING=$(aws ec2 describe-vpc-endpoints \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-endpoint-state,Values=available,pending,deleting" \
+              --query "VpcEndpoints[?contains(ServiceName,'vpce-svc-')] | length(@)" \
+              --output text 2>/dev/null || echo "0")
+            [ "$REMAINING" -eq "0" ] && echo "Consumer endpoint deleted." && break
+            echo "  Still deleting (${i}/18)..."
+            sleep 10
+          done
+
+      - name: Remove Resources from Terraform State
+        # Remove the TGW attachment from state -- the TGW is owned by the
+        # networking account and its attachment lifecycle is managed there.
+        # Also remove SSM endpoints already deleted above.
+        working-directory: terraform/web
+        run: |
+          terraform state rm aws_ec2_transit_gateway_vpc_attachment.main 2>/dev/null || true
+          terraform state rm aws_vpc_endpoint.ssm 2>/dev/null || true
+          terraform state rm aws_vpc_endpoint.ssmmessages 2>/dev/null || true
+          terraform state rm aws_vpc_endpoint.ec2messages 2>/dev/null || true
+          terraform state rm aws_route53_resolver_firewall_rule_group_association.baseline 2>/dev/null || true
+        env:
+          TF_VAR_account_id:                ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_transit_gateway_id:        placeholder
+          TF_VAR_networking_account_id:     ${{ steps.resolve.outputs.networking_account_id }}
+          TF_VAR_dns_firewall_rule_group_arn: placeholder
+          TF_VAR_org_logs_bucket_arn:       "arn:aws:s3:::org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+
+      - name: Terraform Destroy
+        working-directory: terraform/web
+        run: terraform destroy -auto-approve -no-color
+        env:
+          TF_VAR_account_id:                ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_transit_gateway_id:        placeholder
+          TF_VAR_networking_account_id:     ${{ steps.resolve.outputs.networking_account_id }}
+          TF_VAR_dns_firewall_rule_group_arn: placeholder
+          TF_VAR_org_logs_bucket_arn:       "arn:aws:s3:::org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+
+  # --------------------------------------------------------------------------
+  # Job 4 - Destroy Networking
+  # Must run after security, corporate, and web so all TGW attachments and the
+  # PrivateLink consumer endpoint can be removed cleanly.
+  # --------------------------------------------------------------------------
+  destroy-networking:
+    name: Destroy - networking
+    runs-on: ubuntu-latest
+    environment: management
+    needs: [destroy-security, destroy-corporate, destroy-web]
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:       arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name:    GitHubActions-Destroy-networking
+          aws-region:           ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Resolve Account IDs
+        id: resolve
+        run: |
+          NETWORKING_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='networking-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          SECURITY_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='security-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          CORPORATE_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='corporate-main-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          echo "account_id=${NETWORKING_ID}"          >> "$GITHUB_OUTPUT"
+          echo "security_account_id=${SECURITY_ID}"   >> "$GITHUB_OUTPUT"
+          echo "corporate_account_id=${CORPORATE_ID}" >> "$GITHUB_OUTPUT"
+          echo "TF_VAR_account_id=${NETWORKING_ID}"   >> "$GITHUB_ENV"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform/networking
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=networking/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Destroy networking-web workspace (ALB + consumer VPC endpoint)
+        run: |
+          terraform -chdir=terraform/networking-web init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=networking-web/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+          SVC_NAME=$(aws s3 cp \
+            "s3://${{ secrets.TFSTATE_BUCKET_NAME }}/web/terraform.tfstate" - \
+            2>/dev/null | jq -r '.outputs.endpoint_service_name.value // ""' \
+            2>/dev/null || echo "")
+
+          export TF_VAR_web_endpoint_service_name="${SVC_NAME}"
+          terraform -chdir=terraform/networking-web destroy -auto-approve -no-color || true
+
+          # Belt-and-suspenders: delete the ALB by name if Terraform left it behind.
+          # The networking destroy retries 3x so the async ENI release has time to settle.
+          NET_CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${{ steps.resolve.outputs.account_id }}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-ForceDeleteALB" --output json 2>/dev/null || echo "{}")
+          ALB_ARN=$(AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS" | jq -r '.Credentials.AccessKeyId // empty') \
+            AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey // empty') \
+            AWS_SESSION_TOKEN=$(echo "$NET_CREDS" | jq -r '.Credentials.SessionToken // empty') \
+            aws elbv2 describe-load-balancers --region "$AWS_DEFAULT_REGION" \
+              --names "networking-web-alb" \
+              --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || echo "")
+          if [[ -n "$ALB_ARN" && "$ALB_ARN" != "None" ]]; then
+            echo "ALB still present after Terraform destroy -- force-deleting: ${ALB_ARN}"
+            AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS" | jq -r '.Credentials.AccessKeyId // empty') \
+            AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey // empty') \
+            AWS_SESSION_TOKEN=$(echo "$NET_CREDS" | jq -r '.Credentials.SessionToken // empty') \
+            aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN" \
+              --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            sleep 30
+          fi
+        env:
+          TF_VAR_account_id:        ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_state_bucket_name: ${{ secrets.TFSTATE_BUCKET_NAME }}
+
+      - name: Release Stale State Lock
+        run: |
+          BUCKET="${{ secrets.TFSTATE_BUCKET_NAME }}"
+          KEY="networking/terraform.tfstate.lock.info"
+
+          LOCK_JSON=$(aws s3 cp "s3://${BUCKET}/${KEY}" - 2>/dev/null || echo "")
+          LOCK_ID=$(echo "$LOCK_JSON" | jq -r '.ID // ""' 2>/dev/null || echo "")
+
+          if [[ -z "$LOCK_ID" ]]; then
+            echo "INFO: No stale lock found -- skipping."
+            exit 0
+          fi
+
+          echo "INFO: Releasing stale lock ${LOCK_ID} via terraform force-unlock."
+          terraform -chdir=terraform/networking force-unlock -force "$LOCK_ID" && \
+            echo "INFO: Lock released." || \
+            {
+              echo "WARN: force-unlock failed -- falling back to direct S3 delete."
+              aws s3 rm "s3://${BUCKET}/${KEY}" 2>/dev/null && \
+                echo "INFO: Lock file deleted." || echo "WARN: Could not delete lock file."
+            }
+
+      - name: Remove SCP-Protected Resources from Terraform State
+        # Config resources cannot be stopped/deleted due to SCPs.
+        # Remove from state so Terraform skips them during destroy.
+        working-directory: terraform/networking
+        run: |
+          terraform state rm aws_config_configuration_recorder.main 2>/dev/null || true
+          terraform state rm aws_config_delivery_channel.main 2>/dev/null || true
+          terraform state rm aws_config_configuration_recorder_status.main 2>/dev/null || true
+          terraform state rm aws_iam_service_linked_role.config 2>/dev/null || true
+        env:
+          TF_VAR_account_id:               ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_on_prem_wan_ip:           ${{ secrets.TF_VAR_ON_PREM_WAN_IP }}
+          TF_VAR_security_account_id:      ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_security_log_bucket_name: "org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+          TF_VAR_corporate_account_id:     ${{ steps.resolve.outputs.corporate_account_id }}
+          TF_VAR_corporate_tgw_attachment_id: ""
+          TF_VAR_security_tgw_attachment_id:  ""
+          TF_VAR_aws_managed_domain_list_aggregate_id: placeholder
+
+      - name: Resolve DNS Managed Domain List ID
+        id: dns_list
+        run: |
+          # Assume the networking account role to look up the domain list
+          NET_CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${{ steps.resolve.outputs.account_id }}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-Destroy-networking-DNSLookup" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$NET_CREDS"     | jq -r '.Credentials.SessionToken')
+
+          DOMAIN_LIST_ID=$(aws route53resolver list-firewall-domain-lists \
+            --region "$AWS_DEFAULT_REGION" \
+            --query "FirewallDomainLists[?Name=='AWSManagedDomainsBotnetCommandandControl'].Id | [0]" \
+            --output text 2>/dev/null || echo "placeholder")
+          echo "domain_list_id=${DOMAIN_LIST_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Delete VPN Connection and TGW Route Table Entries
+        # The Site-to-Site VPN connection and TGW route table associations
+        # and propagations from phase3 must be removed before networking
+        # destroy. TGW route tables block deletion if they still have
+        # associations or propagations attached.
+        run: |
+          NET_CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${{ steps.resolve.outputs.account_id }}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-CleanupTGW-networking" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$NET_CREDS"     | jq -r '.Credentials.SessionToken')
+
+          # Delete VPN connection
+          VPN_IDS=$(aws ec2 describe-vpn-connections \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=state,Values=available,pending" \
+            --query "VpnConnections[].VpnConnectionId" \
+            --output text 2>/dev/null || echo "")
+          for VPN_ID in $VPN_IDS; do
+            echo "Deleting VPN connection: ${VPN_ID}"
+            aws ec2 delete-vpn-connection \
+              --vpn-connection-id "$VPN_ID" \
+              --region "$AWS_DEFAULT_REGION" 2>/dev/null && \
+              echo "  Deleted." || echo "  Could not delete."
+          done
+
+          # Delete TGW route table associations (non-egress)
+          TGW_RTS=$(aws ec2 describe-transit-gateway-route-tables \
+            --region "$AWS_DEFAULT_REGION" \
+            --query "TransitGatewayRouteTables[].TransitGatewayRouteTableId" \
+            --output text 2>/dev/null || echo "")
+
+          for RT_ID in $TGW_RTS; do
+            # Delete associations
+            ASSOC_IDS=$(aws ec2 get-transit-gateway-route-table-associations \
+              --transit-gateway-route-table-id "$RT_ID" \
+              --region "$AWS_DEFAULT_REGION" \
+              --query "Associations[?State!='disassociated'].TransitGatewayAttachmentId" \
+              --output text 2>/dev/null || echo "")
+            for ASSOC_ID in $ASSOC_IDS; do
+              echo "Disassociating ${ASSOC_ID} from route table ${RT_ID}"
+              aws ec2 disassociate-transit-gateway-route-table \
+                --transit-gateway-route-table-id "$RT_ID" \
+                --transit-gateway-attachment-id "$ASSOC_ID" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+
+            # Delete propagations
+            PROP_IDS=$(aws ec2 get-transit-gateway-route-table-propagations \
+              --transit-gateway-route-table-id "$RT_ID" \
+              --region "$AWS_DEFAULT_REGION" \
+              --query "TransitGatewayRouteTablePropagations[?State!='disabled'].TransitGatewayAttachmentId" \
+              --output text 2>/dev/null || echo "")
+            for PROP_ID in $PROP_IDS; do
+              echo "Disabling propagation ${PROP_ID} from route table ${RT_ID}"
+              aws ec2 disable-transit-gateway-route-table-propagation \
+                --transit-gateway-route-table-id "$RT_ID" \
+                --transit-gateway-attachment-id "$PROP_ID" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+          done
+
+          # Delete all TGW attachments in networking account
+          TGW_ATTACH_IDS=$(aws ec2 describe-transit-gateway-vpc-attachments \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=state,Values=available,modifying,pending" \
+            --query "TransitGatewayVpcAttachments[].TransitGatewayAttachmentId" \
+            --output text 2>/dev/null || echo "")
+          for ATTACH_ID in $TGW_ATTACH_IDS; do
+            echo "Deleting TGW VPC attachment: ${ATTACH_ID}"
+            aws ec2 delete-transit-gateway-vpc-attachment \
+              --transit-gateway-attachment-id "$ATTACH_ID" \
+              --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+          done
+
+          if [[ -n "$VPN_IDS" || -n "$TGW_ATTACH_IDS" ]]; then
+            echo "Waiting 60s for TGW resources to fully release..."
+            sleep 60
+          fi
+
+      - name: Delete Orphaned VPCs in Networking Account
+        # Accumulated VPCs from failed deploys in the networking account.
+        run: |
+          NET_CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${{ steps.resolve.outputs.account_id }}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteOrphanVPCs-networking" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$NET_CREDS"     | jq -r '.Credentials.SessionToken')
+
+          ALL_VPCS=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=isDefault,Values=false" \
+            --query "Vpcs[].VpcId" \
+            --output text 2>/dev/null || echo "")
+
+          for VPC_ID in $ALL_VPCS; do
+            # NAT Gateways hold ENIs that block subnet deletion -- remove them first.
+            NAT_IDS=$(aws ec2 describe-nat-gateways \
+              --region "$AWS_DEFAULT_REGION" \
+              --filter "Name=vpc-id,Values=${VPC_ID}" "Name=state,Values=available,pending" \
+              --query "NatGateways[].NatGatewayId" --output text 2>/dev/null || echo "")
+            for NAT_ID in $NAT_IDS; do
+              echo "  Deleting NAT Gateway: ${NAT_ID}"
+              aws ec2 delete-nat-gateway \
+                --nat-gateway-id "$NAT_ID" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+            if [[ -n "$NAT_IDS" && "$NAT_IDS" != "None" ]]; then
+              echo "  Polling until NAT Gateways reach deleted state (up to 10 minutes)..."
+              for i in $(seq 1 60); do
+                REMAINING=$(aws ec2 describe-nat-gateways \
+                  --region "$AWS_DEFAULT_REGION" \
+                  --filter "Name=vpc-id,Values=${VPC_ID}" "Name=state,Values=available,pending,deleting" \
+                  --query "length(NatGateways)" --output text 2>/dev/null || echo "0")
+                [ "$REMAINING" -eq "0" ] && echo "  All NAT Gateways deleted." && break
+                echo "  Still deleting -- ${REMAINING} remaining (${i}/60)"
+                sleep 10
+              done
+            fi
+
+            # Interface VPC endpoints also hold ENIs in subnets.
+            EP_IDS=$(aws ec2 describe-vpc-endpoints \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+                        "Name=vpc-endpoint-state,Values=available,pending" \
+              --query "VpcEndpoints[].VpcEndpointId" --output text 2>/dev/null || echo "")
+            if [[ -n "$EP_IDS" && "$EP_IDS" != "None" ]]; then
+              echo "  Deleting VPC endpoints: ${EP_IDS}"
+              aws ec2 delete-vpc-endpoints --region "$AWS_DEFAULT_REGION" \
+                --vpc-endpoint-ids $EP_IDS 2>/dev/null || true
+              sleep 15
+            fi
+
+            SUBNETS=$(aws ec2 describe-subnets \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query "Subnets[].SubnetId" --output text 2>/dev/null || echo "")
+            for SUBNET in $SUBNETS; do
+              aws ec2 delete-subnet --subnet-id "$SUBNET" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+
+            IGW_IDS=$(aws ec2 describe-internet-gateways \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=attachment.vpc-id,Values=${VPC_ID}" \
+              --query "InternetGateways[].InternetGatewayId" --output text 2>/dev/null || echo "")
+            for IGW in $IGW_IDS; do
+              aws ec2 detach-internet-gateway --internet-gateway-id "$IGW" \
+                --vpc-id "$VPC_ID" --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+              aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+
+            RTS=$(aws ec2 describe-route-tables \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query "RouteTables[?Associations[0].Main!=\`true\`].RouteTableId" \
+              --output text 2>/dev/null || echo "")
+            for RT in $RTS; do
+              aws ec2 delete-route-table --route-table-id "$RT" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+
+            echo "Deleting orphaned VPC: ${VPC_ID}"
+            aws ec2 delete-vpc --vpc-id "$VPC_ID" \
+              --region "$AWS_DEFAULT_REGION" 2>/dev/null && \
+              echo "  Deleted: ${VPC_ID}" || \
+              echo "  Could not delete ${VPC_ID} -- skipping."
+          done
+
+      - name: Delete NAT Gateways
+        # NAT Gateways create ENIs that block subnet deletion.
+        # Must be explicitly deleted before Terraform destroy.
+        run: |
+          NET_CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${{ steps.resolve.outputs.account_id }}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteNAT-networking" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$NET_CREDS"     | jq -r '.Credentials.SessionToken')
+
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=tag:Name,Values=networking-egress-vpc" \
+            --query "Vpcs[0].VpcId" --output text 2>/dev/null || echo "")
+
+          if [[ -n "$VPC_ID" && "$VPC_ID" != "None" ]]; then
+            NAT_IDS=$(aws ec2 describe-nat-gateways \
+              --region "$AWS_DEFAULT_REGION" \
+              --filter "Name=vpc-id,Values=${VPC_ID}" "Name=state,Values=available,pending" \
+              --query "NatGateways[].NatGatewayId" --output text 2>/dev/null || echo "")
+            for NAT_ID in $NAT_IDS; do
+              echo "Deleting NAT Gateway: ${NAT_ID}"
+              aws ec2 delete-nat-gateway \
+                --nat-gateway-id "$NAT_ID" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+            if [[ -n "$NAT_IDS" ]]; then
+              echo "Polling until NAT Gateways reach deleted state (up to 10 minutes)..."
+              for i in $(seq 1 60); do
+                REMAINING=$(aws ec2 describe-nat-gateways \
+                  --region "$AWS_DEFAULT_REGION" \
+                  --filter "Name=vpc-id,Values=${VPC_ID}" "Name=state,Values=available,pending,deleting" \
+                  --query "length(NatGateways)" --output text 2>/dev/null || echo "0")
+                [ "$REMAINING" -eq "0" ] && echo "All NAT Gateways deleted." && break
+                echo "  Still deleting -- ${REMAINING} remaining (${i}/60)"
+                sleep 10
+              done
+              EIP_ALLOC_IDS=$(aws ec2 describe-addresses \
+                --region "$AWS_DEFAULT_REGION" \
+                --filters "Name=domain,Values=vpc" \
+                --query "Addresses[?AssociationId==null].AllocationId" \
+                --output text 2>/dev/null || echo "")
+              for ALLOC_ID in $EIP_ALLOC_IDS; do
+                echo "Releasing EIP: ${ALLOC_ID}"
+                aws ec2 release-address --allocation-id "$ALLOC_ID" \
+                  --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+              done
+            fi
+          else
+            echo "No egress VPC found -- skipping NAT Gateway deletion."
+          fi
+
+      - name: Delete Network Firewall Endpoints and VPC Endpoints
+        # Network Firewall creates ENIs in firewall subnets.
+        # Interface VPC endpoints also create ENIs.
+        # Both must be deleted before subnet/VPC deletion can succeed.
+        run: |
+          NET_CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${{ steps.resolve.outputs.account_id }}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteEndpoints-networking" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$NET_CREDS"     | jq -r '.Credentials.SessionToken')
+
+          # Delete Network Firewall first -- its endpoints take the longest to release
+          FIREWALL_ARN=$(aws network-firewall list-firewalls \
+            --region "$AWS_DEFAULT_REGION" \
+            --query "Firewalls[?FirewallName=='hub-network-firewall'].FirewallArn|[0]" \
+            --output text 2>/dev/null || echo "")
+          if [[ -n "$FIREWALL_ARN" && "$FIREWALL_ARN" != "None" ]]; then
+            echo "Deleting Network Firewall: ${FIREWALL_ARN}"
+            aws network-firewall delete-firewall \
+              --firewall-arn "$FIREWALL_ARN" \
+              --region "$AWS_DEFAULT_REGION" 2>/dev/null && \
+              echo "Firewall deletion initiated -- polling for DELETED state (up to 8 min)." || \
+              echo "Firewall not found or already deleted."
+            for i in $(seq 1 32); do
+              FW_STATUS=$(aws network-firewall describe-firewall \
+                --firewall-arn "$FIREWALL_ARN" \
+                --region "$AWS_DEFAULT_REGION" \
+                --query "FirewallStatus.Status" \
+                --output text 2>/dev/null || echo "DELETED")
+              echo "  Firewall status: ${FW_STATUS} (check ${i}/32)"
+              if [[ "$FW_STATUS" == "DELETED" || -z "$FW_STATUS" ]]; then
+                echo "  Firewall deleted -- endpoints released."
+                break
+              fi
+              sleep 15
+            done
+          fi
+
+          # Delete interface VPC endpoints
+          ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=vpc-endpoint-type,Values=Interface" \
+                      "Name=vpc-endpoint-state,Values=available,pending,pending-acceptance" \
+            --query "VpcEndpoints[*].VpcEndpointId" --output text 2>/dev/null || echo "")
+          if [[ -n "$ENDPOINT_IDS" && "$ENDPOINT_IDS" != "None" ]]; then
+            echo "Deleting interface endpoints: ${ENDPOINT_IDS}"
+            aws ec2 delete-vpc-endpoints \
+              --region "$AWS_DEFAULT_REGION" \
+              --vpc-endpoint-ids ${ENDPOINT_IDS} 2>/dev/null || true
+            echo "Waiting 30s for endpoints to release..."
+            sleep 30
+          else
+            echo "No interface endpoints found."
+          fi
+
+      - name: Delete Orphaned Network Interfaces
+        # Catch any remaining ENIs not released by NAT/Firewall/Endpoint deletion.
+        run: |
+          NET_CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${{ steps.resolve.outputs.account_id }}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteENI-networking" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$NET_CREDS"     | jq -r '.Credentials.SessionToken')
+
+          ENI_IDS=$(aws ec2 describe-network-interfaces \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=status,Values=available" \
+            --query "NetworkInterfaces[].NetworkInterfaceId" \
+            --output text 2>/dev/null || echo "")
+
+          if [[ -z "$ENI_IDS" || "$ENI_IDS" == "None" ]]; then
+            echo "No orphaned ENIs found."
+          else
+            for ENI_ID in $ENI_IDS; do
+              echo "Deleting orphaned ENI: ${ENI_ID}"
+              aws ec2 delete-network-interface \
+                --network-interface-id "$ENI_ID" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+          fi
+
+      - name: Delete Non-Default Security Groups
+        # Security groups block VPC deletion if they still exist.
+        # Default SG cannot be deleted -- skip it.
+        run: |
+          NET_CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${{ steps.resolve.outputs.account_id }}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DeleteSG-networking" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$NET_CREDS"     | jq -r '.Credentials.SessionToken')
+
+          SG_IDS=$(aws ec2 describe-security-groups \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=group-name,Values=!default" \
+            --query "SecurityGroups[?GroupName!='default'].GroupId" \
+            --output text 2>/dev/null || echo "")
+
+          if [[ -z "$SG_IDS" || "$SG_IDS" == "None" ]]; then
+            echo "No non-default security groups found."
+          else
+            for SG_ID in $SG_IDS; do
+              echo "Deleting security group: ${SG_ID}"
+              aws ec2 delete-security-group \
+                --group-id "$SG_ID" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+          fi
+
+      - name: Clean Up Remaining Networking VPCs
+        run: |
+          NET_CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${{ steps.resolve.outputs.account_id }}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-VPCCleanup-networking" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS" | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$NET_CREDS" | jq -r '.Credentials.SessionToken')
+
+          VPC_IDS=$(aws ec2 describe-vpcs \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=isDefault,Values=false" \
+            --query "Vpcs[].VpcId" \
+            --output text 2>/dev/null || echo "")
+          if [ -z "$VPC_IDS" ] || [ "$VPC_IDS" = "None" ]; then
+            echo "No non-default VPCs remaining -- nothing to pre-clean."
+            exit 0
+          fi
+          for VPC_ID in $VPC_IDS; do
+            echo "Cleaning up remaining resources in VPC: ${VPC_ID}"
+
+            # Delete any remaining NAT Gateways (create ENIs that block subnets).
+            NAT_IDS=$(aws ec2 describe-nat-gateways \
+              --region "$AWS_DEFAULT_REGION" \
+              --filter "Name=vpc-id,Values=${VPC_ID}" "Name=state,Values=available,pending" \
+              --query "NatGateways[].NatGatewayId" --output text 2>/dev/null || echo "")
+            if [ -n "$NAT_IDS" ] && [ "$NAT_IDS" != "None" ]; then
+              for NAT_ID in $NAT_IDS; do
+                echo "  Deleting NAT Gateway: ${NAT_ID}"
+                aws ec2 delete-nat-gateway --nat-gateway-id "$NAT_ID" \
+                  --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+              done
+              echo "  Polling until NAT Gateways reach deleted state (up to 10 minutes)..."
+              for i in $(seq 1 60); do
+                REMAINING=$(aws ec2 describe-nat-gateways \
+                  --region "$AWS_DEFAULT_REGION" \
+                  --filter "Name=vpc-id,Values=${VPC_ID}" "Name=state,Values=available,pending,deleting" \
+                  --query "length(NatGateways)" --output text 2>/dev/null || echo "0")
+                [ "$REMAINING" -eq "0" ] && echo "  All NAT Gateways deleted." && break
+                echo "  Still deleting -- ${REMAINING} remaining (${i}/60)"
+                sleep 10
+              done
+              EIP_ALLOC_IDS=$(aws ec2 describe-addresses \
+                --region "$AWS_DEFAULT_REGION" \
+                --filters "Name=domain,Values=vpc" \
+                --query "Addresses[?AssociationId==null].AllocationId" \
+                --output text 2>/dev/null || echo "")
+              for ALLOC_ID in $EIP_ALLOC_IDS; do
+                echo "  Releasing EIP: ${ALLOC_ID}"
+                aws ec2 release-address --allocation-id "$ALLOC_ID" \
+                  --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+              done
+            fi
+
+            # Delete any remaining VPC endpoints.
+            ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+                        "Name=vpc-endpoint-state,Values=available,pending" \
+              --query "VpcEndpoints[].VpcEndpointId" \
+              --output text 2>/dev/null || echo "")
+            if [ -n "$ENDPOINT_IDS" ] && [ "$ENDPOINT_IDS" != "None" ]; then
+              aws ec2 delete-vpc-endpoints --region "$AWS_DEFAULT_REGION" \
+                --vpc-endpoint-ids $ENDPOINT_IDS 2>/dev/null || true
+              for i in $(seq 1 12); do
+                REMAINING=$(aws ec2 describe-vpc-endpoints \
+                  --region "$AWS_DEFAULT_REGION" \
+                  --filters "Name=vpc-id,Values=${VPC_ID}" \
+                            "Name=vpc-endpoint-state,Values=available,pending,deleting" \
+                  --query "length(VpcEndpoints)" --output text 2>/dev/null || echo "0")
+                [ "$REMAINING" -eq "0" ] && echo "  Endpoints deleted." && break
+                sleep 10
+              done
+            fi
+
+            # Detach and delete Internet Gateway.
+            IGW_IDS=$(aws ec2 describe-internet-gateways \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=attachment.vpc-id,Values=${VPC_ID}" \
+              --query "InternetGateways[].InternetGatewayId" \
+              --output text 2>/dev/null || echo "")
+            for IGW in $IGW_IDS; do
+              echo "  Detaching/deleting IGW: ${IGW}"
+              aws ec2 detach-internet-gateway --internet-gateway-id "$IGW" \
+                --vpc-id "$VPC_ID" --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+              aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" \
+                --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+            done
+
+            # Delete all subnets.
+            SUBNET_IDS=$(aws ec2 describe-subnets \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query "Subnets[].SubnetId" \
+              --output text 2>/dev/null || echo "")
+            for SUBNET_ID in $SUBNET_IDS; do
+              echo "  Deleting subnet: ${SUBNET_ID}"
+              aws ec2 delete-subnet --region "$AWS_DEFAULT_REGION" --subnet-id "$SUBNET_ID" 2>/dev/null || true
+            done
+
+            # Delete all non-main route tables.
+            ALL_RTS=$(aws ec2 describe-route-tables \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query "RouteTables[].RouteTableId" --output text 2>/dev/null || echo "")
+            MAIN_RT=$(aws ec2 describe-route-tables \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" "Name=association.main,Values=true" \
+              --query "RouteTables[0].RouteTableId" --output text 2>/dev/null || echo "")
+            for RT_ID in $ALL_RTS; do
+              if [ "$RT_ID" != "$MAIN_RT" ] && [ -n "$RT_ID" ] && [ "$RT_ID" != "None" ]; then
+                echo "  Deleting route table: ${RT_ID}"
+                aws ec2 delete-route-table --region "$AWS_DEFAULT_REGION" --route-table-id "$RT_ID" 2>/dev/null || true
+              fi
+            done
+          done
+
+          echo "Networking VPC pre-destroy cleanup complete."
+
+      - name: Refresh AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:       arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name:    GitHubActions-Destroy-networking
+          aws-region:           ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Terraform Destroy
+        working-directory: terraform/networking
+        env:
+          TF_VAR_account_id:               ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_on_prem_wan_ip:           ${{ secrets.TF_VAR_ON_PREM_WAN_IP }}
+          TF_VAR_security_account_id:      ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_security_log_bucket_name: "org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+          TF_VAR_corporate_account_id:                 ${{ steps.resolve.outputs.corporate_account_id }}
+          TF_VAR_corporate_tgw_attachment_id:          ""
+          TF_VAR_security_tgw_attachment_id:           ""
+          TF_VAR_aws_managed_domain_list_aggregate_id: ${{ steps.dns_list.outputs.domain_list_id }}
+        run: |
+          # Network Firewall rule groups can take >10 minutes to delete.
+          # AWS continues deletion asynchronously after a timeout, so a
+          # second attempt succeeds once the resources are actually gone.
+          for attempt in 1 2 3; do
+            echo "Terraform destroy attempt ${attempt}/3..."
+            if terraform destroy -auto-approve -no-color; then
+              echo "Destroy succeeded on attempt ${attempt}."
+              exit 0
+            fi
+            if [[ $attempt -lt 3 ]]; then
+              echo "Destroy failed -- waiting 60s for AWS to finish async deletions..."
+              sleep 60
+            fi
+          done
+          echo "Destroy failed after 3 attempts."
+          exit 1
+
+
+  # --------------------------------------------------------------------------
+  # Job 4 - Destroy Management Account Resources (optional)
+  # --------------------------------------------------------------------------
+  destroy-management:
+    runs-on: ubuntu-latest
+    needs: [destroy-security, destroy-corporate, destroy-web, destroy-networking]
+    if: ${{ github.event.inputs.destroy_management == 'true' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:       arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Resolve Account IDs
+        id: resolve
+        run: |
+          echo "management_account_id=${{ secrets.MANAGEMENT_ACCOUNT_ID }}" >> $GITHUB_OUTPUT
+          SECURITY_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='security-environment'].Id|[0]" \
+            --output text)
+          echo "security_account_id=${SECURITY_ID}" >> $GITHUB_OUTPUT
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform/management
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=management/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -input=false -no-color
+
+      - name: Remove SCP-Protected and Lifecycle-Protected Resources from State
+        working-directory: terraform/management
+        run: |
+          # SCPs cannot be destroyed while attached -- detach first via CLI
+          # then remove from state so Terraform doesn't attempt to destroy them.
+          # FullAWSAccess attachment is managed by AWS and cannot be deleted.
+          echo "Removing SCP attachments and policies from state..."
+          terraform state rm aws_organizations_policy_attachment.baseline_guardrails_root 2>/dev/null || true
+          terraform state rm aws_organizations_policy_attachment.region_restriction_root 2>/dev/null || true
+          terraform state rm aws_organizations_policy_attachment.enforce_ebs_encryption_root 2>/dev/null || true
+          terraform state rm aws_organizations_policy_attachment.tag_policy_root 2>/dev/null || true
+          terraform state rm aws_organizations_policy_attachment.full_aws_access_root 2>/dev/null || true
+          terraform state rm aws_organizations_policy.baseline_guardrails 2>/dev/null || true
+          terraform state rm aws_organizations_policy.region_restriction 2>/dev/null || true
+          terraform state rm aws_organizations_policy.enforce_ebs_encryption 2>/dev/null || true
+          terraform state rm aws_organizations_policy.tag_policy 2>/dev/null || true
+          terraform state rm terraform_data.detach_full_aws_access_non_root 2>/dev/null || true
+
+          # Remove CloudTrail -- org trail cannot be deleted while org-wide
+          # logging is active without first disabling it via CLI.
+          terraform state rm aws_cloudtrail.org 2>/dev/null || true
+
+          # Remove Config aggregator authorization -- depends on member accounts
+          terraform state rm aws_config_aggregate_authorization.security 2>/dev/null || true
+
+          # CloudTrail Event Data Store has termination_protection_enabled = true.
+          # Terraform cannot delete it without first disabling protection.
+          # We disable protection via CLI below then remove from state to let
+          # Terraform destroy handle deletion cleanly on the next pass, OR we
+          # simply remove from state and let the CLI step below delete it.
+          terraform state rm aws_cloudtrail_event_data_store.management_insights 2>/dev/null || true
+
+          # AD Connector TGW attachment -- networking (and therefore the TGW)
+          # is already destroyed by the time management destroy runs.
+          # Remove from state to prevent a failed delete attempt against a
+          # TGW that no longer exists.
+          terraform state rm aws_ec2_transit_gateway_vpc_attachment.identity 2>/dev/null || true
+
+          # Identity VPC stack -- the AD Connector ENIs remain in the identity
+          # subnets until IAM Identity Center is manually disconnected from the
+          # directory (console-only operation). Terraform cannot delete the
+          # subnets while ENIs are in use. Remove the entire identity VPC stack
+          # from state; these resources are left in AWS for manual cleanup:
+          #   1. IAM Identity Center → Settings → Change identity source
+          #   2. Directory Service → delete the AD Connector
+          #   3. Delete the identity VPC and subnets
+          terraform state rm "aws_directory_service_directory.ad_connector[0]" 2>/dev/null || true
+          terraform state rm "aws_security_group.ad_connector[0]" 2>/dev/null || true
+          terraform state rm "aws_subnet.identity[0]" 2>/dev/null || true
+          terraform state rm "aws_subnet.identity[1]" 2>/dev/null || true
+          terraform state rm "aws_route_table_association.identity[0]" 2>/dev/null || true
+          terraform state rm "aws_route_table_association.identity[1]" 2>/dev/null || true
+          terraform state rm "aws_route_table.identity[0]" 2>/dev/null || true
+          terraform state rm "aws_vpc.identity[0]" 2>/dev/null || true
+
+          # IAM service-linked roles -- both fail due to active dependencies
+          # (Access Analyzer org analyzer still registered; Config recorder still
+          # active in the management account). Remove from state; SLRs are cheap
+          # to leave and are reused automatically on next deploy.
+          terraform state rm aws_iam_service_linked_role.access_analyzer 2>/dev/null || true
+          terraform state rm aws_iam_service_linked_role.config 2>/dev/null || true
+
+          # Resources with lifecycle.prevent_destroy -- Terraform refuses to
+          # plan their deletion. Remove from state so destroy can proceed;
+          # the resources are left in AWS (negligible cost, recreated on redeploy).
+          # alarms.tf -- metric filters (5) and metric alarms (5)
+          terraform state rm aws_cloudwatch_log_metric_filter.root_usage 2>/dev/null || true
+          terraform state rm aws_cloudwatch_log_metric_filter.console_no_mfa 2>/dev/null || true
+          terraform state rm aws_cloudwatch_log_metric_filter.unauthorized_api 2>/dev/null || true
+          terraform state rm aws_cloudwatch_log_metric_filter.scp_changes 2>/dev/null || true
+          terraform state rm aws_cloudwatch_log_metric_filter.cloudtrail_changes 2>/dev/null || true
+          terraform state rm aws_cloudwatch_metric_alarm.root_usage 2>/dev/null || true
+          terraform state rm aws_cloudwatch_metric_alarm.console_no_mfa 2>/dev/null || true
+          terraform state rm aws_cloudwatch_metric_alarm.unauthorized_api 2>/dev/null || true
+          terraform state rm aws_cloudwatch_metric_alarm.scp_changes 2>/dev/null || true
+          terraform state rm aws_cloudwatch_metric_alarm.cloudtrail_changes 2>/dev/null || true
+          # management_cloudtrail.tf -- log group, IAM role, role policy, trail
+          terraform state rm aws_cloudwatch_log_group.cloudtrail 2>/dev/null || true
+          terraform state rm aws_iam_role.cloudtrail_cloudwatch 2>/dev/null || true
+          terraform state rm aws_iam_role_policy.cloudtrail_cloudwatch 2>/dev/null || true
+          # security_delegations.tf -- SNS topic and topic policy
+          terraform state rm aws_sns_topic.security_alarms 2>/dev/null || true
+          terraform state rm aws_sns_topic_policy.security_alarms 2>/dev/null || true
+
+      - name: Detach SCPs Before Destroy
+        run: |
+          # Detach custom SCPs from root before Terraform destroy
+          # so member accounts aren't left without FullAWSAccess
+          ROOT_ID=$(aws organizations list-roots \
+            --query "Roots[0].Id" --output text)
+
+          for POLICY_NAME in baseline-guardrails region-restriction-us-west-1 enforce-ebs-encryption org-tag-standards; do
+            POLICY_ID=$(aws organizations list-policies \
+              --filter SERVICE_CONTROL_POLICY \
+              --query "Policies[?Name=='${POLICY_NAME}'].Id|[0]" \
+              --output text 2>/dev/null || echo "")
+            if [[ -n "$POLICY_ID" && "$POLICY_ID" != "None" ]]; then
+              echo "Detaching ${POLICY_NAME} (${POLICY_ID}) from root..."
+              aws organizations detach-policy \
+                --policy-id "$POLICY_ID" \
+                --target-id "$ROOT_ID" 2>/dev/null && \
+                echo "  Detached." || \
+                echo "  Already detached or not found."
+            fi
+          done
+
+          # Delete the tag policy (different type -- detach first)
+          TAG_POLICY_ID=$(aws organizations list-policies \
+            --filter TAG_POLICY \
+            --query "Policies[?Name=='org-tag-standards'].Id|[0]" \
+            --output text 2>/dev/null || echo "")
+          if [[ -n "$TAG_POLICY_ID" && "$TAG_POLICY_ID" != "None" ]]; then
+            echo "Detaching tag policy ${TAG_POLICY_ID}..."
+            aws organizations detach-policy \
+              --policy-id "$TAG_POLICY_ID" \
+              --target-id "$ROOT_ID" 2>/dev/null || true
+          fi
+
+      - name: Delete CloudTrail Event Data Store
+        # The event data store has termination_protection_enabled = true, which
+        # blocks Terraform destroy. Disable protection and delete it via CLI
+        # before destroy runs. The resource is removed from state above so
+        # Terraform does not attempt a second delete.
+        run: |
+          DS_ARN=$(aws cloudtrail list-event-data-stores \
+            --region "$AWS_DEFAULT_REGION" \
+            --query "EventDataStores[?Name=='management-insights-datastore'].EventDataStoreArn | [0]" \
+            --output text 2>/dev/null || echo "")
+          if [[ -z "$DS_ARN" || "$DS_ARN" == "None" ]]; then
+            echo "Event data store not found -- skipping."
+            exit 0
+          fi
+          echo "Disabling termination protection on ${DS_ARN}..."
+          aws cloudtrail update-event-data-store \
+            --event-data-store "$DS_ARN" \
+            --no-termination-protection-enabled \
+            --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+          echo "Deleting event data store..."
+          aws cloudtrail delete-event-data-store \
+            --event-data-store "$DS_ARN" \
+            --region "$AWS_DEFAULT_REGION" 2>/dev/null && \
+            echo "Deleted." || echo "Delete failed or already deleted -- continuing."
+
+      - name: Terraform Destroy
+        working-directory: terraform/management
+        run: |
+          set -o pipefail
+          terraform destroy -auto-approve -no-color 2>&1 | tee /tmp/tf_mgmt_destroy.log || true
+
+          # Suppress known expected errors
+          UNEXPECTED=$(grep "^Error:" /tmp/tf_mgmt_destroy.log \
+            | grep -v "OrganizationNotFoundException" \
+            | grep -v "NoSuchEntityException" \
+            | grep -v "ResourceNotFoundException" \
+            | grep -v "does not exist" \
+            | grep -v "provision not found" \
+            | grep -v "Assignment not found") || true
+
+          if [[ -n "$UNEXPECTED" ]]; then
+            echo "::error::Unexpected error(s) in management destroy:"
+            echo "$UNEXPECTED"
+            exit 1
+          fi
+          echo "Management destroy complete."
+        env:
+          TF_VAR_account_id:          ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_security_account_id: ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_environment:         dev
+          TF_VAR_state_bucket_name:   ${{ secrets.TFSTATE_BUCKET_NAME }}
+
+  # --------------------------------------------------------------------------
+  # Job 5 - Destroy Bootstrap State Bucket (optional)
+  # Must run last -- every other job reads and writes the state bucket.
+  # Runs after destroy-networking (which depends on security and corporate).
+  # If destroy-management is also selected it must complete first; if it is
+  # skipped (not selected), this job still runs after networking succeeds.
+  # --------------------------------------------------------------------------
+  destroy-bootstrap:
+    name: Destroy - state bucket
+    runs-on: ubuntu-latest
+    environment: management
+    needs: [destroy-networking, destroy-management]
+    if: |
+      always() &&
+      github.event.inputs.destroy_state_bucket == 'true' &&
+      needs.destroy-networking.result == 'success' &&
+      (needs.destroy-management.result == 'success' || needs.destroy-management.result == 'skipped')
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials (Management)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:       arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name:    GitHubActions-Destroy-bootstrap
+          aws-region:           ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Assume Role in Shared Services Account
+        run: |
+          SHARED_SERVICES_ID=$(aws organizations list-accounts \
+            --query "Accounts[?Name=='shared-services-environment'&&Status=='ACTIVE'].Id|[0]" \
+            --output text)
+          [[ -z "$SHARED_SERVICES_ID" || "$SHARED_SERVICES_ID" == "None" ]] && \
+            { echo "ERROR: shared-services-environment account not found"; exit 1; }
+          echo "::add-mask::${SHARED_SERVICES_ID}"
+
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${SHARED_SERVICES_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-Destroy-StateBucket" \
+            --output json) || { echo "ERROR: Failed to assume role in shared-services account"; exit 1; }
+
+          KEY=$(echo "$CREDS"    | jq -r '.Credentials.AccessKeyId')
+          SECRET=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          TOKEN=$(echo "$CREDS"  | jq -r '.Credentials.SessionToken')
+
+          echo "::add-mask::${KEY}"
+          echo "::add-mask::${SECRET}"
+          echo "::add-mask::${TOKEN}"
+
+          echo "AWS_ACCESS_KEY_ID=${KEY}"         >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=${SECRET}"  >> "$GITHUB_ENV"
+          echo "AWS_SESSION_TOKEN=${TOKEN}"        >> "$GITHUB_ENV"
+
+      - name: Empty and Delete State Bucket
+        run: |
+          BUCKET="${{ secrets.TFSTATE_BUCKET_NAME }}"
+
+          if [ -z "$BUCKET" ] || [ "$BUCKET" = "None" ]; then
+            echo "TFSTATE_BUCKET_NAME secret is empty -- nothing to delete."
+            exit 0
+          fi
+
+          # Verify the bucket exists before attempting deletion
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Bucket ${BUCKET} does not exist or is not accessible -- nothing to do."
+            exit 0
+          fi
+
+          echo "WARNING: Permanently deleting Terraform state bucket ${BUCKET}."
+          echo "All Terraform state will be lost. Re-run terraform/bootstrap to deploy again."
+
+          # Paginated batch delete -- same pattern as org-logs bucket.
+          # The state bucket has versioning enabled so all versions and delete
+          # markers must be explicitly removed before the bucket can be deleted.
+          while true; do
+            BATCH=$(aws s3api list-object-versions \
+              --bucket "$BUCKET" \
+              --max-items 500 \
+              --output json 2>/dev/null || echo '{}')
+            OBJECTS=$(echo "$BATCH" | jq -c '{
+              Objects: (
+                [(.Versions // [])[] | {Key:.Key, VersionId:.VersionId}] +
+                [(.DeleteMarkers // [])[] | {Key:.Key, VersionId:.VersionId}]
+              )
+            }')
+            COUNT=$(echo "$OBJECTS" | jq '.Objects | length')
+            if [[ "$COUNT" -eq "0" ]]; then
+              echo "  Bucket is empty."
+              break
+            fi
+            echo "  Deleting batch of ${COUNT} state object versions..."
+            aws s3api delete-objects \
+              --bucket "$BUCKET" \
+              --delete "$OBJECTS" \
+              --bypass-governance-retention 2>/dev/null || \
+            aws s3api delete-objects \
+              --bucket "$BUCKET" \
+              --delete "$OBJECTS" 2>/dev/null || true
+          done
+
+          aws s3 rb "s3://${BUCKET}" --force 2>/dev/null && \
+            echo "State bucket deleted. Run terraform/bootstrap on next deploy." || \
+            echo "Bucket ${BUCKET} already deleted or could not be removed."

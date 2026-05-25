@@ -1,0 +1,1601 @@
+# .github/workflows/terraform-deploy.yaml
+
+name: Terraform Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      corporate_dc_ami_id:
+        description: "Override only: normally leave blank -- the deploy auto-discovers the latest preserved DC AMI by tag (PreservedDC=true). Provide an explicit ami-xxxxxxxx ID only to force a specific AMI (e.g. a pre-tag legacy AMI or a rollback target)."
+        required: false
+        default: ""
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Job 1 - Resolve AWS Account IDs
+  #
+  # Prerequisites: run terraform-bootstrap.yaml once before the first deploy
+  # to create the S3 remote state bucket (TFSTATE_BUCKET_NAME secret).
+  # --------------------------------------------------------------------------
+  resolve-accounts:
+    name: Resolve Account IDs
+    runs-on: ubuntu-latest
+    environment: management
+    outputs:
+      security_account_id:   ${{ steps.resolve.outputs.security_account_id }}
+      networking_account_id: ${{ steps.resolve.outputs.networking_account_id }}
+      corporate_account_id:  ${{ steps.resolve.outputs.corporate_account_id }}
+      web_account_id:        ${{ steps.resolve.outputs.web_account_id }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name: GitHubActions-ResolveAccounts
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Resolve All Member Account IDs
+        id: resolve
+        run: |
+          ACCOUNTS=$(aws organizations list-accounts --output json)
+
+          SECURITY_ID=$(echo "$ACCOUNTS"   | jq -r '.Accounts[] | select(.Name=="security-environment"       and .Status=="ACTIVE") | .Id')
+          NETWORKING_ID=$(echo "$ACCOUNTS" | jq -r '.Accounts[] | select(.Name=="networking-environment"     and .Status=="ACTIVE") | .Id')
+          CORPORATE_ID=$(echo "$ACCOUNTS"  | jq -r '.Accounts[] | select(.Name=="corporate-main-environment" and .Status=="ACTIVE") | .Id')
+          WEB_ID=$(echo "$ACCOUNTS"        | jq -r '.Accounts[] | select(.Name=="web-environment"            and .Status=="ACTIVE") | .Id')
+
+          [[ -z "$SECURITY_ID"   ]] && { echo "ERROR: security-environment not found in org";       exit 1; }
+          [[ -z "$NETWORKING_ID" ]] && { echo "ERROR: networking-environment not found in org";     exit 1; }
+          [[ -z "$CORPORATE_ID"  ]] && { echo "ERROR: corporate-main-environment not found in org"; exit 1; }
+          [[ -z "$WEB_ID"        ]] && { echo "ERROR: web-environment not found in org";            exit 1; }
+
+          echo "security_account_id=$SECURITY_ID"     >> "$GITHUB_OUTPUT"
+          echo "networking_account_id=$NETWORKING_ID" >> "$GITHUB_OUTPUT"
+          echo "corporate_account_id=$CORPORATE_ID"   >> "$GITHUB_OUTPUT"
+          echo "web_account_id=$WEB_ID"               >> "$GITHUB_OUTPUT"
+
+  # --------------------------------------------------------------------------
+  # Job 2 - Security Scan HCL Gate
+  # --------------------------------------------------------------------------
+  security-scan-hcl:
+    name: Security Scan - HCL Gate
+    runs-on: ubuntu-latest
+    needs: [resolve-accounts]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Checkov
+        run: pip install checkov --break-system-packages
+
+      - name: Run Checkov HCL Scan
+        id: checkov
+        run: |
+          checkov -d terraform/ --config-file "$GITHUB_WORKSPACE/checkov.yaml" --framework terraform \
+            --output sarif --output-file-path /tmp/checkov-hcl-out/ \
+            2>&1 | tee /tmp/checkov-hcl.log
+          CHECKOV_EXIT=${PIPESTATUS[0]}
+          if [[ -f /tmp/checkov-hcl-out/results_sarif.sarif ]]; then
+            cp /tmp/checkov-hcl-out/results_sarif.sarif /tmp/checkov-hcl.sarif
+          else
+            echo '{"version":"2.1.0","runs":[]}' > /tmp/checkov-hcl.sarif
+          fi
+          exit $CHECKOV_EXIT
+
+      - name: Upload SARIF to GitHub Security Tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: /tmp/checkov-hcl.sarif
+        continue-on-error: true
+
+      - name: Upload SARIF Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checkov-hcl-sarif
+          path: /tmp/checkov-hcl.sarif
+
+
+  deploy-networking:
+    name: Deploy - networking
+    runs-on: ubuntu-latest
+    environment: management
+    needs: [resolve-accounts, security-scan-hcl, deploy-management-scps]
+    if: |
+      always() &&
+      needs.resolve-accounts.result == 'success' &&
+      needs.security-scan-hcl.result == 'success' &&
+      (needs.deploy-management-scps.result == 'success' ||
+       needs.deploy-management-scps.result == 'skipped')
+    outputs:
+      transit_gateway_id:          ${{ steps.capture_outputs.outputs.transit_gateway_id }}
+      dns_firewall_rule_group_arn: ${{ steps.capture_outputs.outputs.dns_firewall_rule_group_arn }}
+      dns_firewall_rule_group_id:  ${{ steps.capture_outputs.outputs.dns_firewall_rule_group_id }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name: GitHubActions-Deploy-networking
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Resolve DNS Firewall Managed Domain List IDs
+        run: |
+          AGGREGATE_ID=$(aws route53resolver list-firewall-domain-lists \
+            --region "${{ env.AWS_DEFAULT_REGION }}" \
+            --query "FirewallDomainLists[?Name=='AWSManagedDomainsAggregateThreatList'].Id|[0]" \
+            --output text)
+          [[ -z "$AGGREGATE_ID" || "$AGGREGATE_ID" == "None" ]] && \
+            { echo "ERROR: Cannot resolve AWSManagedDomainsAggregateThreatList"; exit 1; }
+          echo "TF_VAR_aws_managed_domain_list_aggregate_id=$AGGREGATE_ID" >> "$GITHUB_ENV"
+
+      - name: Mask Org Data
+        run: |
+          while IFS= read -r v; do [ -n "$v" ] && echo "::add-mask::$v"; done \
+            < <(aws organizations list-accounts --query "Accounts[].Id" --output text | tr '\t' '\n')
+          while IFS= read -r v; do [ -n "$v" ] && echo "::add-mask::$v"; done \
+            < <(aws organizations list-accounts --query "Accounts[].Email" --output text | tr '\t' '\n')
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform/networking
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=networking/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      # Must run after Terraform Init so the S3 backend is configured and
+      # terraform state list can read the remote state file.
+      # Checks whether Phase 3 resources are already managed in state.
+      # If they are, pass org_logs_bucket_exists=true so Phase 2 does not
+      # destroy them (destroying the logging config mid-apply invalidates the
+      # Network Firewall update token, causing InvalidTokenException).
+      # If they are not in state, pass false so Phase 2 skips creating them --
+      # Phase 3 creates them after deploy-members applies updated policies.
+      - name: Detect Phase 3 Resources In State
+        id: check_bucket
+        working-directory: terraform/networking
+        run: |
+          EXISTS="false"
+          # Check for ANY Phase 3 resource in state.  A partial failure on a
+          # previous run may have destroyed some (e.g. flow log, recorder
+          # status) but not others (e.g. delivery channel blocked by SCP).
+          # As long as any of them exist, Phase 3 has run before and the
+          # org-logs bucket must be live -- keep org_logs_bucket_exists=true
+          # so Phase 2 does not destroy whatever survives.
+          PHASE3_RESOURCES=(
+            'aws_flow_log.egress_vpc[0]'
+            'aws_config_delivery_channel.main[0]'
+            'aws_config_configuration_recorder_status.main[0]'
+            'aws_networkfirewall_logging_configuration.main[0]'
+          )
+          for resource in "${PHASE3_RESOURCES[@]}"; do
+            if terraform state show "$resource" > /dev/null 2>&1; then
+              EXISTS="true"
+              echo "INFO: Phase 3 sentinel found in state: ${resource}"
+              break
+            fi
+          done
+          [[ "$EXISTS" == "false" ]] && echo "INFO: No Phase 3 resources found in state."
+          echo "org_logs_bucket_exists=${EXISTS}" >> "$GITHUB_OUTPUT"
+          echo "TF_VAR_org_logs_bucket_exists=${EXISTS}" >> "$GITHUB_ENV"
+          echo "INFO: Phase 3 resources in state: ${EXISTS}"
+
+      - name: Terraform Format Check
+        working-directory: terraform/networking
+        run: terraform fmt -check
+
+      - name: Terraform Validate
+        working-directory: terraform/networking
+        run: terraform validate -no-color
+
+      - name: Import Pre-Existing Networking Account Resources
+        working-directory: terraform/networking
+        env:
+          IMPORT_NETWORKING_ACCOUNT_ID: ${{ needs.resolve-accounts.outputs.networking_account_id }}
+        run: |
+          "$GITHUB_WORKSPACE/scripts/networking-import-resources.sh"
+
+      # Detect and import any VPN TGW attachment route table association that
+      # exists in AWS but is absent from Terraform state.
+      #
+      # FIXED BUG (prior versions): The previous implementation used
+      # `aws ec2 describe-transit-gateway-attachments` to discover the
+      # attachment and route table IDs. That AWS CLI call runs as the
+      # management account (the GitHub-OIDC role assumed at job start), but
+      # the TGW and its attachments live in the networking account. The API
+      # returned zero results every run, the script exited 0 with "nothing to
+      # import", and the apply then failed with Resource.AlreadyAssociated.
+      #
+      # The fix avoids the AWS CLI describe call entirely. Both
+      # aws_vpn_connection.on_prem (which holds transit_gateway_attachment_id)
+      # and aws_ec2_transit_gateway_route_table.spoke are already in Terraform
+      # state at this point. `terraform show -json` reads directly from the
+      # local state file -- no AWS API call, no account boundary to cross.
+      # `terraform import` uses the configured AWS provider which already
+      # assumes OrganizationAccountAccessRole in the networking account, so it
+      # has the correct permissions to look up and import the resource.
+      - name: Reconcile Drifted TGW VPN Association
+        working-directory: terraform/networking
+        env:
+          TF_VAR_on_prem_wan_ip:           ${{ secrets.TF_VAR_on_prem_wan_ip }}
+          TF_VAR_corporate_account_id:     ${{ needs.resolve-accounts.outputs.corporate_account_id }}
+          TF_VAR_security_account_id:      ${{ needs.resolve-accounts.outputs.security_account_id }}
+          TF_VAR_management_account_id:    ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_security_log_bucket_name: "org-logs-${{ needs.resolve-accounts.outputs.security_account_id }}-v2"
+          # TF_VAR_account_id and TF_VAR_aws_managed_domain_list_aggregate_id
+          # are inherited from $GITHUB_ENV (written by earlier steps).
+        run: |
+          # Step 1 -- Already in Terraform state? Nothing to do.
+          if terraform state show \
+              aws_ec2_transit_gateway_route_table_association.vpn \
+              > /dev/null 2>&1; then
+            echo "aws_ec2_transit_gateway_route_table_association.vpn is already in state -- skipping import."
+            exit 0
+          fi
+
+          echo "Resource not in state -- reading attachment and route table IDs from state."
+
+          # Step 2 -- Read IDs from Terraform state via `terraform show -json`.
+          #
+          # This is a purely local read of the state file; it makes no AWS API
+          # calls and is unaffected by which account the shell is running as.
+          #
+          # aws_vpn_connection.on_prem carries transit_gateway_attachment_id.
+          # aws_ec2_transit_gateway_route_table.spoke carries its own id.
+          # Both are guaranteed to be in state before this association is needed.
+          TF_JSON=$(terraform show -json 2>/dev/null || echo "{}")
+
+          ATTACH_ID=$(echo "$TF_JSON" | jq -r '
+            try (
+              .values.root_module.resources[]
+              | select(.type == "aws_vpn_connection" and .name == "on_prem")
+              | .values.transit_gateway_attachment_id
+            ) // ""' 2>/dev/null || echo "")
+
+          RT_ID=$(echo "$TF_JSON" | jq -r '
+            try (
+              .values.root_module.resources[]
+              | select(.type == "aws_ec2_transit_gateway_route_table" and .name == "spoke")
+              | .values.id
+            ) // ""' 2>/dev/null || echo "")
+
+          if [[ -z "$ATTACH_ID" || "$ATTACH_ID" == "null" || \
+                -z "$RT_ID"     || "$RT_ID"     == "null" ]]; then
+            echo "VPN connection or spoke route table not yet deployed -- nothing to import."
+            exit 0
+          fi
+
+          echo "VPN attachment ID : $ATTACH_ID"
+          echo "Spoke RT ID       : $RT_ID"
+          echo "Import ID         : ${RT_ID}_${ATTACH_ID}"
+
+          # Step 3 -- Attempt import.
+          set +e
+          terraform import \
+              -input=false \
+              aws_ec2_transit_gateway_route_table_association.vpn \
+              "${RT_ID}_${ATTACH_ID}"
+          IMPORT_EXIT=$?
+          set -e
+
+          if [[ $IMPORT_EXIT -eq 0 ]]; then
+            echo "Import successful -- VPN RT association is now tracked in state."
+            exit 0
+          fi
+
+          # Step 4 -- Import failed. Benign if the resource is now in state
+          # (raced with a concurrent apply between Step 1 and Step 3).
+          if terraform state show \
+              aws_ec2_transit_gateway_route_table_association.vpn \
+              > /dev/null 2>&1; then
+            echo "Resource is already managed by Terraform (import raced with state) -- nothing to do."
+            exit 0
+          fi
+
+          echo "::error::terraform import failed and aws_ec2_transit_gateway_route_table_association.vpn is not in state."
+          exit 1
+
+      - name: Terraform Plan
+        working-directory: terraform/networking
+        run: terraform plan -input=false -no-color -out=tfplan.bin
+        env:
+          TF_VAR_account_id:                   ${{ needs.resolve-accounts.outputs.networking_account_id }}
+          TF_VAR_on_prem_wan_ip:               ${{ secrets.TF_VAR_on_prem_wan_ip }}
+          TF_VAR_corporate_account_id:         ${{ needs.resolve-accounts.outputs.corporate_account_id }}
+          TF_VAR_security_account_id:          ${{ needs.resolve-accounts.outputs.security_account_id }}
+          TF_VAR_management_account_id:        ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_web_account_id:               ${{ needs.resolve-accounts.outputs.web_account_id }}
+          TF_VAR_security_log_bucket_name:     "org-logs-${{ needs.resolve-accounts.outputs.security_account_id }}-v2"
+          TF_VAR_org_logs_bucket_exists:       ${{ steps.check_bucket.outputs.org_logs_bucket_exists }}
+
+      - name: Checkov Plan Scan - networking
+        continue-on-error: true
+        working-directory: terraform/networking
+        run: |
+          pip install checkov --break-system-packages -q
+          terraform show -json tfplan.bin > /tmp/tfplan-networking.json
+          checkov -f /tmp/tfplan-networking.json \
+            --config-file "$GITHUB_WORKSPACE/checkov.yaml" \
+            --framework terraform_plan \
+            --output sarif \
+            --output-file-path /tmp/checkov-plan-networking-out/ \
+            2>&1 | tee /tmp/checkov-plan-networking.log || true
+          if [[ -f /tmp/checkov-plan-networking-out/results_sarif.sarif ]]; then
+            cp /tmp/checkov-plan-networking-out/results_sarif.sarif /tmp/checkov-plan-networking.sarif
+          else
+            echo '{"version":"2.1.0","runs":[]}' > /tmp/checkov-plan-networking.sarif
+          fi
+
+      - name: Upload Plan SARIF - networking
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: /tmp/checkov-plan-networking.sarif
+          category: checkov-plan-networking
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        working-directory: terraform/networking
+        run: |
+          "$GITHUB_WORKSPACE/scripts/tf-apply-filter.sh" networking \
+            "AlreadyAssociated" \
+            "AWSServiceRoleForConfig has been taken" \
+            "A resource with the specified name already exists" \
+            "InvalidTokenException"
+        env:
+          TF_VAR_account_id:                   ${{ needs.resolve-accounts.outputs.networking_account_id }}
+          TF_VAR_on_prem_wan_ip:               ${{ secrets.TF_VAR_on_prem_wan_ip }}
+          TF_VAR_corporate_account_id:         ${{ needs.resolve-accounts.outputs.corporate_account_id }}
+          TF_VAR_security_account_id:          ${{ needs.resolve-accounts.outputs.security_account_id }}
+          TF_VAR_management_account_id:        ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_web_account_id:               ${{ needs.resolve-accounts.outputs.web_account_id }}
+          TF_VAR_security_log_bucket_name:     "org-logs-${{ needs.resolve-accounts.outputs.security_account_id }}-v2"
+          TF_VAR_org_logs_bucket_exists:       ${{ steps.check_bucket.outputs.org_logs_bucket_exists }}
+
+      - name: Capture Networking Outputs
+        id: capture_outputs
+        if: always()
+        working-directory: terraform/networking
+        env:
+          IMPORT_SECURITY_ACCOUNT_ID:  ${{ needs.resolve-accounts.outputs.security_account_id }}
+          IMPORT_CORPORATE_ACCOUNT_ID: ${{ needs.resolve-accounts.outputs.corporate_account_id }}
+          IMPORT_NETWORKING_ACCOUNT_ID: ${{ needs.resolve-accounts.outputs.networking_account_id }}
+        run: |
+          "$GITHUB_WORKSPACE/scripts/networking-capture-outputs.sh"
+
+
+  # --------------------------------------------------------------------------
+  # Job 4a - Apply SCPs before member accounts run
+  #
+  # SCPs live in the management workspace but must be current before any
+  # member-account deploy runs. The full deploy-management job runs last
+  # (after member accounts) because it references security remote state.
+  # This job targets only the SCP and tag-policy resources -- none of
+  # which depend on security remote state -- so it is safe to run early.
+  # --------------------------------------------------------------------------
+  deploy-management-scps:
+    name: Deploy - management SCPs
+    runs-on: ubuntu-latest
+    environment: management
+    needs: [resolve-accounts, security-scan-hcl]
+    if: |
+      always() &&
+      needs.resolve-accounts.result == 'success' &&
+      needs.security-scan-hcl.result == 'success'
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name: GitHubActions-Deploy-mgmt-scps
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Register Delegated Administrators
+        run: |
+          "$GITHUB_WORKSPACE/scripts/delegate-administrators.sh"
+          echo "INFO: Sleeping 60s for Organizations delegations to propagate..."
+          sleep 60
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform/management
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=management/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Import Pre-Existing Service Admin Accounts
+        working-directory: terraform/management
+        env:
+          TF_VAR_account_id:               ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_state_bucket_name:        ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_security_account_id:      ${{ needs.resolve-accounts.outputs.security_account_id }}
+          TF_VAR_networking_account_id:    ${{ needs.resolve-accounts.outputs.networking_account_id }}
+          TF_VAR_corporate_account_id:     ${{ needs.resolve-accounts.outputs.corporate_account_id }}
+          TF_VAR_web_account_id:           ${{ needs.resolve-accounts.outputs.web_account_id }}
+          TF_VAR_enable_sso_assignments:   "false"
+        run: |
+          SECURITY_ID="${{ needs.resolve-accounts.outputs.security_account_id }}"
+          MGMT_ID="${{ secrets.MANAGEMENT_ACCOUNT_ID }}"
+          ORG_ROOT_ID=$(aws organizations list-roots \
+            --query "Roots[0].Id" --output text 2>/dev/null || echo "")
+
+          safe_import() {
+            local address="$1" id="$2" log
+            log=$(mktemp)
+            set +e
+            terraform import -input=false "$address" "$id" 2>&1 | tee "$log"
+            local exit_code=${PIPESTATUS[0]}
+            set -e
+            if [[ $exit_code -eq 0 ]]; then
+              echo "INFO: Imported ${address}"
+            elif grep -qiE "Resource already managed|already exists in state" "$log"; then
+              echo "INFO: ${address} already in state -- skipping."
+            else
+              echo "INFO: ${address} not found or cannot import: $(tail -1 "$log")"
+            fi
+          }
+
+          # Import SCP policies and root attachments where they already exist.
+          # safe_import logs a warning and continues if the resource doesn't exist,
+          # so Terraform can create it during the apply step.
+          for POLICY_NAME in baseline-guardrails region-restriction-us-west-1 enforce-ebs-encryption; do
+            POLICY_ID=$(aws organizations list-policies \
+              --filter SERVICE_CONTROL_POLICY \
+              --query "Policies[?Name=='${POLICY_NAME}'].Id|[0]" \
+              --output text 2>/dev/null || echo "")
+            if [[ -n "$POLICY_ID" && "$POLICY_ID" != "None" ]]; then
+              case "$POLICY_NAME" in
+                baseline-guardrails)
+                  safe_import aws_organizations_policy.baseline_guardrails "$POLICY_ID"
+                  [[ -n "$ORG_ROOT_ID" ]] && \
+                    safe_import aws_organizations_policy_attachment.baseline_guardrails_root "${ORG_ROOT_ID}:${POLICY_ID}"
+                  ;;
+                region-restriction-us-west-1)
+                  safe_import aws_organizations_policy.region_restriction "$POLICY_ID"
+                  [[ -n "$ORG_ROOT_ID" ]] && \
+                    safe_import aws_organizations_policy_attachment.region_restriction_root "${ORG_ROOT_ID}:${POLICY_ID}"
+                  ;;
+                enforce-ebs-encryption)
+                  safe_import aws_organizations_policy.enforce_ebs_encryption "$POLICY_ID"
+                  [[ -n "$ORG_ROOT_ID" ]] && \
+                    safe_import aws_organizations_policy_attachment.enforce_ebs_encryption_root "${ORG_ROOT_ID}:${POLICY_ID}"
+                  ;;
+              esac
+            fi
+          done
+
+          # Tag policy (TAG_POLICY type -- separate filter from SERVICE_CONTROL_POLICY)
+          TAG_POLICY_ID=$(aws organizations list-policies \
+            --filter TAG_POLICY \
+            --query "Policies[?Name=='org-tag-standards'].Id|[0]" \
+            --output text 2>/dev/null || echo "")
+          if [[ -n "$TAG_POLICY_ID" && "$TAG_POLICY_ID" != "None" ]]; then
+            safe_import aws_organizations_policy.tag_policy "$TAG_POLICY_ID"
+            [[ -n "$ORG_ROOT_ID" ]] && \
+              safe_import aws_organizations_policy_attachment.tag_policy_root "${ORG_ROOT_ID}:${TAG_POLICY_ID}"
+          fi
+
+          # full_aws_access_root is imported via HCL import block (uses local.org_root_id).
+
+          GD_DETECTOR=$(aws guardduty list-detectors \
+            --query "DetectorIds[0]" --output text 2>/dev/null || echo "")
+          [[ -n "$GD_DETECTOR" && "$GD_DETECTOR" != "None" ]] && \
+            safe_import aws_guardduty_detector.management "$GD_DETECTOR"
+
+          GD_ADMIN=$(aws guardduty list-organization-admin-accounts \
+            --query "AdminAccounts[?AdminAccountId=='${SECURITY_ID}'].AdminAccountId|[0]" \
+            --output text 2>/dev/null || echo "")
+          [[ -n "$GD_ADMIN" && "$GD_ADMIN" != "None" ]] && \
+            safe_import aws_guardduty_organization_admin_account.main "$SECURITY_ID"
+
+          SH_ARN=$(aws securityhub describe-hub \
+            --query "HubArn" --output text 2>/dev/null || echo "")
+          [[ -n "$SH_ARN" && "$SH_ARN" != "None" ]] && \
+            safe_import aws_securityhub_account.management "$MGMT_ID"
+
+          SH_ADMIN=$(aws securityhub list-organization-admin-accounts \
+            --query "AdminAccounts[?AccountId=='${SECURITY_ID}'].AccountId|[0]" \
+            --output text 2>/dev/null || echo "")
+          [[ -n "$SH_ADMIN" && "$SH_ADMIN" != "None" ]] && \
+            safe_import aws_securityhub_organization_admin_account.main "$SECURITY_ID"
+
+          # Inspector2: enable delegated admin via CLI.
+          # aws_inspector2_delegate_admin_account triggers a schema validation
+          # bug in Terraform 1.11.0; managed via CLI instead of Terraform.
+          I2_ADMIN=$(aws inspector2 list-delegated-admin-accounts \
+            --query "delegatedAdminAccounts[?accountId=='${SECURITY_ID}'].accountId|[0]" \
+            --output text 2>/dev/null || echo "")
+          if [[ -z "$I2_ADMIN" || "$I2_ADMIN" == "None" ]]; then
+            aws inspector2 enable-delegated-admin-account \
+              --delegated-admin-account-id "$SECURITY_ID" 2>/dev/null && \
+              echo "INFO: Inspector2 delegated admin enabled for ${SECURITY_ID}" || \
+              echo "INFO: Inspector2 delegated admin enable failed (non-fatal -- may already be set)"
+          else
+            echo "INFO: Inspector2 delegated admin already set for ${SECURITY_ID}"
+          fi
+
+      - name: Apply SCPs and Tag Policies
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        working-directory: terraform/management
+        run: |
+          terraform apply -auto-approve -no-color \
+            -target=aws_organizations_policy.baseline_guardrails \
+            -target=aws_organizations_policy.region_restriction \
+            -target=aws_organizations_policy.enforce_ebs_encryption \
+            -target=aws_organizations_policy.security_service_protection \
+            -target=aws_organizations_policy.tag_policy \
+            -target=aws_organizations_policy_attachment.baseline_guardrails_root \
+            -target=aws_organizations_policy_attachment.region_restriction_root \
+            -target=aws_organizations_policy_attachment.enforce_ebs_encryption_root \
+            -target=aws_organizations_policy_attachment.security_service_protection_root \
+            -target=aws_organizations_policy_attachment.tag_policy_root \
+            -target=aws_organizations_policy_attachment.full_aws_access_root \
+            -target=terraform_data.detach_full_aws_access_non_root \
+            -target=aws_guardduty_detector.management \
+            -target=aws_guardduty_organization_admin_account.main \
+            -target=aws_securityhub_account.management \
+            -target=aws_securityhub_organization_admin_account.main
+        env:
+          TF_VAR_account_id:               ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_state_bucket_name:        ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_security_account_id:      ${{ needs.resolve-accounts.outputs.security_account_id }}
+          TF_VAR_networking_account_id:    ${{ needs.resolve-accounts.outputs.networking_account_id }}
+          TF_VAR_corporate_account_id:     ${{ needs.resolve-accounts.outputs.corporate_account_id }}
+          TF_VAR_web_account_id:           ${{ needs.resolve-accounts.outputs.web_account_id }}
+          TF_VAR_enable_sso_assignments:   "false"
+
+  deploy-member-accounts:
+    name: Deploy - ${{ matrix.account }}
+    runs-on: ubuntu-latest
+    environment: management
+    needs: [resolve-accounts, security-scan-hcl, deploy-networking, deploy-management-scps]
+    if: |
+      always() &&
+      needs.resolve-accounts.result == 'success' &&
+      needs.deploy-networking.result == 'success' &&
+      (needs.deploy-management-scps.result == 'success' ||
+       needs.deploy-management-scps.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - account: security
+            org_account_name: security-environment
+          - account: corporate
+            org_account_name: corporate-main-environment
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name: GitHubActions-Deploy-${{ matrix.account }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Resolve Matrix Account ID and SIEM Email
+        id: resolve
+        run: |
+          case "${{ matrix.account }}" in
+            security)  ACCOUNT_ID="${{ needs.resolve-accounts.outputs.security_account_id }}" ;;
+            corporate) ACCOUNT_ID="${{ needs.resolve-accounts.outputs.corporate_account_id }}" ;;
+          esac
+          [[ -z "$ACCOUNT_ID" ]] && { echo "ERROR: Cannot resolve account for '${{ matrix.account }}'"; exit 1; }
+
+          SIEM_EMAIL=$(aws organizations describe-account \
+            --account-id "${{ needs.resolve-accounts.outputs.security_account_id }}" \
+            --query "Account.Email" \
+            --output text)
+          [[ -z "$SIEM_EMAIL" || "$SIEM_EMAIL" == "None" ]] && \
+            { echo "ERROR: Cannot resolve email for security-environment account"; exit 1; }
+
+          echo "account_id=$ACCOUNT_ID"       >> "$GITHUB_OUTPUT"
+          echo "siem_alert_email=$SIEM_EMAIL" >> "$GITHUB_OUTPUT"
+          echo "TF_VAR_account_id=$ACCOUNT_ID" >> "$GITHUB_ENV"
+
+      - name: Mask Org Data
+        run: |
+          while IFS= read -r v; do [ -n "$v" ] && echo "::add-mask::$v"; done \
+            < <(aws organizations list-accounts --query "Accounts[].Id" --output text | tr '\t' '\n')
+          while IFS= read -r v; do [ -n "$v" ] && echo "::add-mask::$v"; done \
+            < <(aws organizations list-accounts --query "Accounts[].Email" --output text | tr '\t' '\n')
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform/${{ matrix.account }}
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=${{ matrix.account }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform Format Check
+        working-directory: terraform/${{ matrix.account }}
+        run: terraform fmt -recursive
+
+      - name: Terraform Validate
+        working-directory: terraform/${{ matrix.account }}
+        run: terraform validate -no-color
+
+      - name: Security Account Import State
+        if: matrix.account == 'security'
+        working-directory: terraform/${{ matrix.account }}
+        env:
+          TF_VAR_account_id:                   ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_transit_gateway_id:           ${{ needs.deploy-networking.outputs.transit_gateway_id }}
+          TF_VAR_dns_firewall_rule_group_arn:  ${{ steps.net_outputs.outputs.dns_firewall_rule_group_arn }}
+          TF_VAR_networking_account_id:        ${{ needs.resolve-accounts.outputs.networking_account_id }}
+
+          TF_VAR_corporate_account_id:         ${{ needs.resolve-accounts.outputs.corporate_account_id }}
+          TF_VAR_web_account_id:               ${{ needs.resolve-accounts.outputs.web_account_id }}
+          TF_VAR_siem_alert_email:             ${{ steps.resolve.outputs.siem_alert_email }}
+          TF_VAR_siem_schedule_enabled:        "false"
+          TF_VAR_org_logs_bucket_arn:          "arn:aws:s3:::org-logs-${{ steps.resolve.outputs.account_id }}-v2"
+          TF_VAR_on_prem_wan_ip:               ${{ secrets.TF_VAR_ON_PREM_WAN_IP }}
+          TF_VAR_security_account_id:          ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_security_log_bucket_name:     "org-logs-${{ steps.resolve.outputs.account_id }}-v2"
+          TF_VAR_state_bucket_name:            ${{ secrets.TFSTATE_BUCKET_NAME }}
+          IMPORT_ACCOUNT_ID:                   ${{ steps.resolve.outputs.account_id }}
+        run: |
+          "$GITHUB_WORKSPACE/scripts/security-import-state.sh"
+
+      - name: Remove Tainted Route53 Association Before Apply
+        if: matrix.account == 'security'
+        working-directory: terraform/${{ matrix.account }}
+        env:
+          IMPORT_ACCOUNT_ID: ${{ steps.resolve.outputs.account_id }}
+        run: |
+          "$GITHUB_WORKSPACE/scripts/security-remove-tainted-route53.sh"
+
+      - name: Validate Networking Outputs
+        id: net_outputs
+        run: |
+          TGW_ID="${{ needs.deploy-networking.outputs.transit_gateway_id }}"
+          DNS_FW_ARN="${{ needs.deploy-networking.outputs.dns_firewall_rule_group_arn }}"
+          DNS_FW_ID="${{ needs.deploy-networking.outputs.dns_firewall_rule_group_id }}"
+          NET_ID="${{ needs.resolve-accounts.outputs.networking_account_id }}"
+          REGION="${AWS_DEFAULT_REGION}"
+
+          if [[ -z "$TGW_ID" ]]; then
+            echo "ERROR: transit_gateway_id output from deploy-networking is empty."
+            exit 1
+          fi
+
+          # Construct ARN from components if the output is empty.
+          # Handles the case where networking outputs.tf was recently added
+          # and the networking module hasn't been redeployed yet.
+          if [[ -z "$DNS_FW_ARN" && -n "$DNS_FW_ID" && -n "$NET_ID" ]]; then
+            DNS_FW_ARN="arn:aws:route53resolver:${REGION}:${NET_ID}:firewall-rule-group/${DNS_FW_ID}"
+            echo "INFO: Constructed dns_firewall_rule_group_arn from components: ${DNS_FW_ARN}"
+          fi
+
+          # Last resort: AWS CLI lookup via networking account role
+          if [[ -z "$DNS_FW_ARN" && "${{ matrix.account }}" == "security" ]]; then
+            echo "INFO: Falling back to AWS CLI for dns_firewall_rule_group_arn"
+            NET_CREDS=$(aws sts assume-role \
+              --role-arn "arn:aws:iam::${NET_ID}:role/OrganizationAccountAccessRole" \
+              --role-session-name "GitHubActions-ResolveDNSFW" \
+              --output json 2>/dev/null || echo "{}")
+            DNS_FW_ARN=$(AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS" | jq -r '.Credentials.AccessKeyId // empty') \
+              AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey // empty') \
+              AWS_SESSION_TOKEN=$(echo "$NET_CREDS" | jq -r '.Credentials.SessionToken // empty') \
+              aws route53resolver list-firewall-rule-groups \
+                --region "$REGION" \
+                --query "FirewallRuleGroups[?Name=='org-baseline-dns-firewall'].Arn|[0]" \
+                --output text 2>/dev/null || echo "")
+            [[ "$DNS_FW_ARN" == "None" ]] && DNS_FW_ARN=""
+            echo "INFO: CLI resolved: ${DNS_FW_ARN}"
+          fi
+
+          [[ -z "$DNS_FW_ARN" && "${{ matrix.account }}" == "security" ]] && \
+            echo "::warning::dns_firewall_rule_group_arn could not be resolved."
+
+          echo "dns_firewall_rule_group_arn=${DNS_FW_ARN}" >> "$GITHUB_OUTPUT"
+          echo "transit_gateway_id=${TGW_ID}" >> "$GITHUB_OUTPUT"
+          echo "Networking outputs validated:"
+          echo "  transit_gateway_id:          $TGW_ID"
+          echo "  dns_firewall_rule_group_arn: ${DNS_FW_ARN:-(not required for ${{ matrix.account }})}"
+      # Corporate Phase 3 resources (Config delivery channel, recorder
+      # status, VPC flow log) are gated by org_logs_bucket_exists.
+      # Poll AWS directly rather than checking TF state: security and corporate
+      # deploy in parallel, so the bucket may not exist yet when this step runs.
+      # Polls every 30s for up to 5 minutes to allow security's apply to finish.
+      - name: Wait for org-logs bucket (corporate only)
+        if: matrix.account == 'corporate'
+        id: check_bucket
+        run: |
+          EXISTS="false"
+          SEC_ID="${{ needs.resolve-accounts.outputs.security_account_id }}"
+          BUCKET_NAME="org-logs-${SEC_ID}-v2"
+          MAX_ATTEMPTS=10
+          SLEEP_SECONDS=30
+
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            SEC_CREDS=$(aws sts assume-role \
+              --role-arn "arn:aws:iam::${SEC_ID}:role/OrganizationAccountAccessRole" \
+              --role-session-name "GitHubActions-CorporateCheckBucket" \
+              --output json 2>/dev/null || echo "{}")
+
+            if [[ "$(echo "$SEC_CREDS" | jq -r '.Credentials.AccessKeyId // empty')" != "" ]]; then
+              if AWS_ACCESS_KEY_ID=$(echo "$SEC_CREDS" | jq -r '.Credentials.AccessKeyId') \
+                 AWS_SECRET_ACCESS_KEY=$(echo "$SEC_CREDS" | jq -r '.Credentials.SecretAccessKey') \
+                 AWS_SESSION_TOKEN=$(echo "$SEC_CREDS" | jq -r '.Credentials.SessionToken') \
+                 aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+                EXISTS="true"
+                echo "INFO: org-logs bucket confirmed (attempt ${attempt}/${MAX_ATTEMPTS}): ${BUCKET_NAME}"
+                break
+              fi
+            fi
+
+            echo "INFO: Bucket not ready (attempt ${attempt}/${MAX_ATTEMPTS}) -- waiting ${SLEEP_SECONDS}s..."
+            [[ $attempt -lt $MAX_ATTEMPTS ]] && sleep $SLEEP_SECONDS
+          done
+
+          if [[ "$EXISTS" == "false" ]]; then
+            echo "WARNING: org-logs bucket not confirmed after ${MAX_ATTEMPTS} attempts -- Phase 3 resources will be skipped."
+          fi
+
+          echo "org_logs_bucket_exists=${EXISTS}" >> "$GITHUB_OUTPUT"
+          echo "INFO: org_logs_bucket_exists=${EXISTS}"
+
+      # Detect whether the Route53 Resolver was previously provisioned by the
+      # terraform-identity.yaml workflow.  If it is in state, preserve it
+      # by passing identity_enabled=true.  The AD Connector now lives in the
+      # management workspace; corporate identity_enabled only gates the
+      # Route53 Resolver endpoint and forwarding rule.
+      - name: Detect Identity Resources In State (corporate only)
+        if: matrix.account == 'corporate'
+        id: check_identity
+        working-directory: terraform/corporate
+        run: |
+          IDENTITY="false"
+          if terraform state show 'aws_route53_resolver_endpoint.outbound[0]' > /dev/null 2>&1; then
+            IDENTITY="true"
+            echo "INFO: Identity sentinel found in state: aws_route53_resolver_endpoint.outbound[0]"
+          fi
+          [[ "$IDENTITY" == "false" ]] && echo "INFO: No identity resources found in state."
+          echo "identity_enabled=${IDENTITY}" >> "$GITHUB_OUTPUT"
+
+      # Auto-discover the latest preserved corporate DC AMI by tag so the
+      # deploy always restores a previously promoted DC without manual input.
+      # The dispatch input 'corporate_dc_ami_id' acts as an explicit override
+      # (e.g. for a pre-tag legacy AMI like the initial ami-0c6714cc244cd3a70).
+      # Skipped for the security matrix run -- output defaults to empty string.
+      - name: Resolve Preserved DC AMI (corporate only)
+        if: matrix.account == 'corporate'
+        id: resolve_dc_ami
+        run: |
+          # Explicit override takes highest priority.
+          if [[ -n "${{ inputs.corporate_dc_ami_id }}" ]]; then
+            AMI_ID="${{ inputs.corporate_dc_ami_id }}"
+            echo "INFO: Using explicit override AMI: ${AMI_ID}"
+          else
+            CORP_ID="${{ steps.resolve.outputs.account_id }}"
+            CREDS=$(aws sts assume-role \
+              --role-arn "arn:aws:iam::${CORP_ID}:role/OrganizationAccountAccessRole" \
+              --role-session-name "GitHubActions-ResolveDCAMI" \
+              --output json)
+            AMI_ID=$(AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.Credentials.AccessKeyId') \
+                     AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey') \
+                     AWS_SESSION_TOKEN=$(echo "$CREDS" | jq -r '.Credentials.SessionToken') \
+                     aws ec2 describe-images \
+                       --region "$AWS_DEFAULT_REGION" \
+                       --owners self \
+                       --filters "Name=tag:PreservedDC,Values=true" \
+                                 "Name=tag:Account,Values=corporate" \
+                                 "Name=state,Values=available" \
+                       --query "sort_by(Images, &CreationDate)[-1].ImageId" \
+                       --output text 2>/dev/null || echo "")
+            [[ "$AMI_ID" == "None" ]] && AMI_ID=""
+            if [[ -n "$AMI_ID" ]]; then
+              echo "INFO: Auto-discovered preserved DC AMI: ${AMI_ID}"
+            else
+              echo "INFO: No preserved DC AMI found -- fresh Windows Server 2025 base image will be used."
+            fi
+          fi
+          echo "dc_ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform Plan
+        working-directory: terraform/${{ matrix.account }}
+        run: terraform plan -input=false -no-color -out=tfplan.bin
+        env:
+          TF_VAR_account_id:                   ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_transit_gateway_id:           ${{ needs.deploy-networking.outputs.transit_gateway_id }}
+          TF_VAR_dns_firewall_rule_group_arn:  ${{ steps.net_outputs.outputs.dns_firewall_rule_group_arn }}
+          TF_VAR_networking_account_id:        ${{ needs.resolve-accounts.outputs.networking_account_id }}
+          TF_VAR_corporate_account_id:         ${{ needs.resolve-accounts.outputs.corporate_account_id }}
+          TF_VAR_web_account_id:               ${{ needs.resolve-accounts.outputs.web_account_id }}
+
+          TF_VAR_org_logs_bucket_arn:          "arn:aws:s3:::org-logs-${{ needs.resolve-accounts.outputs.security_account_id }}-v2"
+          TF_VAR_on_prem_wan_ip:               ${{ secrets.TF_VAR_ON_PREM_WAN_IP }}
+          TF_VAR_siem_alert_email:             ${{ steps.resolve.outputs.siem_alert_email }}
+          TF_VAR_siem_schedule_enabled:        "false"
+          TF_VAR_security_account_id:          ${{ needs.resolve-accounts.outputs.security_account_id }}
+          TF_VAR_security_log_bucket_name:     "org-logs-${{ needs.resolve-accounts.outputs.security_account_id }}-v2"
+          TF_VAR_state_bucket_name:            ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_org_logs_bucket_exists:       ${{ steps.check_bucket.outputs.org_logs_bucket_exists || 'false' }}
+          TF_VAR_identity_enabled:             ${{ steps.check_identity.outputs.identity_enabled || 'false' }}
+          TF_VAR_ad_connector_password:        ${{ secrets.TF_VAR_AD_CONNECTOR_PASSWORD }}
+          TF_VAR_dc_ami_id:                    ${{ steps.resolve_dc_ami.outputs.dc_ami_id || '' }}
+
+      - name: Checkov Plan Scan - ${{ matrix.account }}
+        continue-on-error: true
+        working-directory: terraform/${{ matrix.account }}
+        run: |
+          pip install checkov --break-system-packages -q
+          terraform show -json tfplan.bin > /tmp/tfplan-${{ matrix.account }}.json
+          checkov -f /tmp/tfplan-${{ matrix.account }}.json \
+            --config-file "$GITHUB_WORKSPACE/checkov.yaml" \
+            --framework terraform_plan \
+            --output sarif \
+            --output-file-path /tmp/checkov-plan-${{ matrix.account }}-out/ \
+            2>&1 | tee /tmp/checkov-plan-${{ matrix.account }}.log || true
+          if [[ -f /tmp/checkov-plan-${{ matrix.account }}-out/results_sarif.sarif ]]; then
+            cp /tmp/checkov-plan-${{ matrix.account }}-out/results_sarif.sarif /tmp/checkov-plan-${{ matrix.account }}.sarif
+          else
+            echo '{"version":"2.1.0","runs":[]}' > /tmp/checkov-plan-${{ matrix.account }}.sarif
+          fi
+
+      - name: Upload Plan SARIF - ${{ matrix.account }}
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: /tmp/checkov-plan-${{ matrix.account }}.sarif
+          category: checkov-plan-${{ matrix.account }}
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        working-directory: terraform/${{ matrix.account }}
+        run: |
+          "$GITHUB_WORKSPACE/scripts/tf-apply-filter.sh" "${{ matrix.account }}" \
+            "AWSServiceRoleForConfig has been taken" \
+            "publishingDestination already exists" \
+            "WorkGroup is already created" \
+            "ACCESS_DENIED: Account is not authorized" \
+            "firewallRuleGroupId.*failed to satisfy constraint" \
+            "AssociateFirewallRuleGroup" \
+            "RSLVR-01306"
+        env:
+          TF_VAR_account_id:                   ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_transit_gateway_id:           ${{ needs.deploy-networking.outputs.transit_gateway_id }}
+          TF_VAR_dns_firewall_rule_group_arn:  ${{ steps.net_outputs.outputs.dns_firewall_rule_group_arn }}
+          TF_VAR_networking_account_id:        ${{ needs.resolve-accounts.outputs.networking_account_id }}
+          TF_VAR_corporate_account_id:         ${{ needs.resolve-accounts.outputs.corporate_account_id }}
+          TF_VAR_web_account_id:               ${{ needs.resolve-accounts.outputs.web_account_id }}
+
+          TF_VAR_org_logs_bucket_arn:          "arn:aws:s3:::org-logs-${{ needs.resolve-accounts.outputs.security_account_id }}-v2"
+          TF_VAR_on_prem_wan_ip:               ${{ secrets.TF_VAR_ON_PREM_WAN_IP }}
+          TF_VAR_siem_alert_email:             ${{ steps.resolve.outputs.siem_alert_email }}
+          TF_VAR_siem_schedule_enabled:        "false"
+          TF_VAR_security_account_id:          ${{ needs.resolve-accounts.outputs.security_account_id }}
+          TF_VAR_security_log_bucket_name:     "org-logs-${{ needs.resolve-accounts.outputs.security_account_id }}-v2"
+          TF_VAR_state_bucket_name:            ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_org_logs_bucket_exists:       ${{ steps.check_bucket.outputs.org_logs_bucket_exists || 'false' }}
+          TF_VAR_identity_enabled:             ${{ steps.check_identity.outputs.identity_enabled || 'false' }}
+          TF_VAR_ad_connector_password:        ${{ secrets.TF_VAR_AD_CONNECTOR_PASSWORD }}
+          TF_VAR_dc_ami_id:                    ${{ steps.resolve_dc_ami.outputs.dc_ami_id || '' }}
+
+  # --------------------------------------------------------------------------
+  # Job 5 - Deploy Web Spoke
+  # Runs in parallel with deploy-member-accounts (both after deploy-networking).
+  # SCPs are already active from deploy-management-scps. TGW routes for the
+  # web spoke are completed in Phase 3 (deploy-networking-phase3) after this
+  # job's TGW attachment is known.
+  # --------------------------------------------------------------------------
+  deploy-web:
+    name: Deploy - web
+    runs-on: ubuntu-latest
+    environment: management
+    needs: [resolve-accounts, security-scan-hcl, deploy-networking, deploy-management-scps, deploy-member-accounts]
+    if: |
+      always() &&
+      needs.resolve-accounts.result == 'success' &&
+      needs.deploy-networking.result == 'success' &&
+      needs.deploy-member-accounts.result == 'success' &&
+      (needs.deploy-management-scps.result == 'success' ||
+       needs.deploy-management-scps.result == 'skipped')
+    outputs:
+      tgw_attachment_id:        ${{ steps.capture_outputs.outputs.tgw_attachment_id }}
+      endpoint_service_name:    ${{ steps.capture_outputs.outputs.endpoint_service_name }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name: GitHubActions-Deploy-web
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform/web
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=web/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform Format Check
+        working-directory: terraform/web
+        run: terraform fmt -check
+
+      - name: Terraform Validate
+        working-directory: terraform/web
+        run: terraform validate -no-color
+
+      - name: Validate Networking Outputs
+        id: net_outputs
+        run: |
+          TGW_ID="${{ needs.deploy-networking.outputs.transit_gateway_id }}"
+          DNS_FW_ARN="${{ needs.deploy-networking.outputs.dns_firewall_rule_group_arn }}"
+          DNS_FW_ID="${{ needs.deploy-networking.outputs.dns_firewall_rule_group_id }}"
+          NET_ID="${{ needs.resolve-accounts.outputs.networking_account_id }}"
+          REGION="${AWS_DEFAULT_REGION}"
+
+          [[ -z "$TGW_ID" ]] && { echo "ERROR: transit_gateway_id is empty."; exit 1; }
+
+          if [[ -z "$DNS_FW_ARN" && -n "$DNS_FW_ID" && -n "$NET_ID" ]]; then
+            DNS_FW_ARN="arn:aws:route53resolver:${REGION}:${NET_ID}:firewall-rule-group/${DNS_FW_ID}"
+          fi
+
+          if [[ -z "$DNS_FW_ARN" ]]; then
+            NET_CREDS=$(aws sts assume-role \
+              --role-arn "arn:aws:iam::${NET_ID}:role/OrganizationAccountAccessRole" \
+              --role-session-name "GitHubActions-Web-ResolveDNSFW" \
+              --output json 2>/dev/null || echo "{}")
+            DNS_FW_ARN=$(AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS" | jq -r '.Credentials.AccessKeyId // empty') \
+              AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey // empty') \
+              AWS_SESSION_TOKEN=$(echo "$NET_CREDS" | jq -r '.Credentials.SessionToken // empty') \
+              aws route53resolver list-firewall-rule-groups \
+                --region "$REGION" \
+                --query "FirewallRuleGroups[?Name=='org-baseline-dns-firewall'].Arn|[0]" \
+                --output text 2>/dev/null || echo "")
+            [[ "$DNS_FW_ARN" == "None" ]] && DNS_FW_ARN=""
+          fi
+
+          [[ -z "$DNS_FW_ARN" ]] && echo "::warning::dns_firewall_rule_group_arn could not be resolved."
+
+          echo "dns_firewall_rule_group_arn=${DNS_FW_ARN}" >> "$GITHUB_OUTPUT"
+          echo "transit_gateway_id=${TGW_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform Plan
+        working-directory: terraform/web
+        run: terraform plan -input=false -no-color -out=tfplan.bin
+        env:
+          TF_VAR_account_id:                  ${{ needs.resolve-accounts.outputs.web_account_id }}
+          TF_VAR_transit_gateway_id:          ${{ steps.net_outputs.outputs.transit_gateway_id }}
+          TF_VAR_dns_firewall_rule_group_arn: ${{ steps.net_outputs.outputs.dns_firewall_rule_group_arn }}
+          TF_VAR_networking_account_id:       ${{ needs.resolve-accounts.outputs.networking_account_id }}
+          TF_VAR_org_logs_bucket_arn:         "arn:aws:s3:::org-logs-${{ needs.resolve-accounts.outputs.security_account_id }}-v2"
+          TF_VAR_org_logs_bucket_exists:      "true"
+
+      - name: Pre-Disconnect Networking Consumer Endpoint (if NLB replacement planned)
+        # When the NLB is replaced (new SG or name change), the consumer VPC
+        # endpoint in the networking account holds an active connection to the
+        # old endpoint service. AWS considers the old NLB "in use" and rejects
+        # its deletion with ResourceInUse, even after the endpoint service has
+        # been updated to point to the new NLB.
+        #
+        # This step checks the saved plan for a planned NLB replacement and, if
+        # found, deletes the consumer VPC endpoint first so no active connections
+        # exist when Terraform destroys the old NLB. Phase 3 (networking-web)
+        # recreates the consumer endpoint afterward.
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        working-directory: terraform/web
+        run: |
+          NLB_REPLACE=$(terraform show -json tfplan.bin 2>/dev/null | \
+            jq -r '[.resource_changes[] | select(.address == "aws_lb.nlb") | .change.actions[]] |
+                   if (index("delete") != null) and (index("create") != null) then "true" else "false" end' \
+            2>/dev/null || echo "false")
+
+          if [[ "$NLB_REPLACE" != "true" ]]; then
+            echo "No NLB replacement planned -- skipping consumer endpoint pre-disconnect."
+            exit 0
+          fi
+
+          echo "NLB replacement detected -- pre-disconnecting networking consumer VPC endpoint..."
+
+          NET_ID="${{ needs.resolve-accounts.outputs.networking_account_id }}"
+          NET_CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${NET_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DisconnectWebEndpoint" \
+            --output json)
+          export AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$NET_CREDS"     | jq -r '.Credentials.SessionToken')
+
+          EP_IDS=$(aws ec2 describe-vpc-endpoints \
+            --region "$AWS_DEFAULT_REGION" \
+            --filters "Name=tag:Name,Values=networking-web-endpoint" \
+                      "Name=vpc-endpoint-state,Values=available,pending,pending-acceptance" \
+            --query "VpcEndpoints[].VpcEndpointId" --output text 2>/dev/null || echo "")
+
+          if [[ -z "$EP_IDS" || "$EP_IDS" == "None" ]]; then
+            echo "No active networking consumer endpoint found -- nothing to disconnect."
+            exit 0
+          fi
+
+          echo "Deleting consumer endpoint(s): ${EP_IDS}"
+          aws ec2 delete-vpc-endpoints \
+            --region "$AWS_DEFAULT_REGION" \
+            --vpc-endpoint-ids ${EP_IDS} 2>/dev/null || true
+
+          echo "Polling until endpoint reaches deleted state (up to 5 minutes)..."
+          for i in $(seq 1 30); do
+            REMAINING=$(aws ec2 describe-vpc-endpoints \
+              --region "$AWS_DEFAULT_REGION" \
+              --filters "Name=tag:Name,Values=networking-web-endpoint" \
+                        "Name=vpc-endpoint-state,Values=available,pending,pending-acceptance,deleting" \
+              --query "length(VpcEndpoints)" --output text 2>/dev/null || echo "0")
+            [ "$REMAINING" -eq "0" ] && echo "Consumer endpoint deleted." && break
+            echo "  Still deleting (${i}/30)..."
+            sleep 10
+          done
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        working-directory: terraform/web
+        run: terraform apply -auto-approve -no-color
+        env:
+          TF_VAR_account_id:                  ${{ needs.resolve-accounts.outputs.web_account_id }}
+          TF_VAR_transit_gateway_id:          ${{ steps.net_outputs.outputs.transit_gateway_id }}
+          TF_VAR_dns_firewall_rule_group_arn: ${{ steps.net_outputs.outputs.dns_firewall_rule_group_arn }}
+          TF_VAR_networking_account_id:       ${{ needs.resolve-accounts.outputs.networking_account_id }}
+          TF_VAR_org_logs_bucket_arn:         "arn:aws:s3:::org-logs-${{ needs.resolve-accounts.outputs.security_account_id }}-v2"
+          TF_VAR_org_logs_bucket_exists:      "true"
+
+      - name: Capture Web Outputs
+        id: capture_outputs
+        if: always()
+        working-directory: terraform/web
+        run: |
+          ATT_ID=$(terraform output -raw tgw_attachment_id 2>/dev/null || echo "")
+          SVC_NAME=$(terraform output -raw endpoint_service_name 2>/dev/null || echo "")
+          echo "tgw_attachment_id=${ATT_ID}"     >> "$GITHUB_OUTPUT"
+          echo "endpoint_service_name=${SVC_NAME}" >> "$GITHUB_OUTPUT"
+          echo "### Web Spoke Deploy" >> "$GITHUB_STEP_SUMMARY"
+          [[ -n "$ATT_ID" ]]   && echo "TGW Attachment: ${ATT_ID}"        >> "$GITHUB_STEP_SUMMARY"
+          [[ -n "$SVC_NAME" ]] && echo "Endpoint Service: ${SVC_NAME}"   >> "$GITHUB_STEP_SUMMARY"
+          echo "(ALB DNS will appear after deploy-networking-phase3)"     >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # Job 6 - Networking Phase 3
+  # --------------------------------------------------------------------------
+  deploy-networking-phase3:
+    name: Deploy - networking (phase 3 RT associations + logging config)
+    runs-on: ubuntu-latest
+    environment: management
+    needs: [resolve-accounts, deploy-networking, deploy-member-accounts, deploy-web]
+    if: |
+      always() &&
+      needs.resolve-accounts.result == 'success' &&
+      needs.deploy-networking.result == 'success' &&
+      needs.deploy-member-accounts.result == 'success' &&
+      (needs.deploy-web.result == 'success' ||
+       needs.deploy-web.result == 'failure')
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name: GitHubActions-Deploy-networking-phase3
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Resolve Account IDs and TGW Attachment IDs
+        id: resolve
+        env:
+          IMPORT_MANAGEMENT_ACCOUNT_ID: ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          IMPORT_TGW_ID:                ${{ needs.deploy-networking.outputs.transit_gateway_id }}
+          IMPORT_SECURITY_ACCOUNT_ID:   ${{ needs.resolve-accounts.outputs.security_account_id }}
+          IMPORT_NETWORKING_ACCOUNT_ID: ${{ needs.resolve-accounts.outputs.networking_account_id }}
+          IMPORT_CORPORATE_ACCOUNT_ID:  ${{ needs.resolve-accounts.outputs.corporate_account_id }}
+          IMPORT_WEB_ACCOUNT_ID:        ${{ needs.resolve-accounts.outputs.web_account_id }}
+        run: |
+          "$GITHUB_WORKSPACE/scripts/phase3-resolve-accounts.sh"
+
+      - name: Read Management TGW Attachment from State
+        id: mgmt_att
+        run: |
+          MGMT_STATE=$(aws s3 cp \
+            "s3://${{ secrets.TFSTATE_BUCKET_NAME }}/management/terraform.tfstate" - \
+            2>/dev/null || echo "{}")
+          MGMT_ATT=$(echo "$MGMT_STATE" | jq -r '.outputs.management_tgw_attachment_id.value // ""')
+          [[ "$MGMT_ATT" == "null" ]] && MGMT_ATT=""
+          echo "management_tgw_attachment_id=${MGMT_ATT}" >> "$GITHUB_OUTPUT"
+          if [[ -n "$MGMT_ATT" ]]; then
+            echo "INFO: Found management TGW attachment in state: $MGMT_ATT"
+          else
+            echo "INFO: No management TGW attachment in state -- management RT association will be skipped."
+          fi
+
+      - name: Resolve DNS Firewall Managed Domain List IDs
+        run: |
+          AGGREGATE_ID=$(aws route53resolver list-firewall-domain-lists \
+            --region "${{ env.AWS_DEFAULT_REGION }}" \
+            --query "FirewallDomainLists[?Name=='AWSManagedDomainsAggregateThreatList'].Id|[0]" \
+            --output text)
+          [[ -z "$AGGREGATE_ID" || "$AGGREGATE_ID" == "None" ]] && \
+            { echo "ERROR: Cannot resolve AWSManagedDomainsAggregateThreatList"; exit 1; }
+          echo "TF_VAR_aws_managed_domain_list_aggregate_id=$AGGREGATE_ID" >> "$GITHUB_ENV"
+
+      - name: Mask Org Data
+        run: |
+          while IFS= read -r v; do [ -n "$v" ] && echo "::add-mask::$v"; done \
+            < <(aws organizations list-accounts --query "Accounts[].Id" --output text | tr '\t' '\n')
+          while IFS= read -r v; do [ -n "$v" ] && echo "::add-mask::$v"; done \
+            < <(aws organizations list-accounts --query "Accounts[].Email" --output text | tr '\t' '\n')
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform/networking
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=networking/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      # Same fix as deploy-networking: use terraform show -json to read IDs
+      # from local state rather than calling the AWS API from the wrong account.
+      - name: Reconcile Drifted TGW VPN Association
+        working-directory: terraform/networking
+        env:
+          TF_VAR_on_prem_wan_ip:              ${{ secrets.TF_VAR_on_prem_wan_ip }}
+          TF_VAR_corporate_account_id:        ${{ steps.resolve.outputs.corporate_account_id }}
+          TF_VAR_security_account_id:         ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_management_account_id:       ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_web_account_id:              ${{ steps.resolve.outputs.web_account_id }}
+          TF_VAR_corporate_tgw_attachment_id: ${{ steps.resolve.outputs.corporate_tgw_attachment_id }}
+          TF_VAR_security_tgw_attachment_id:  ${{ steps.resolve.outputs.security_tgw_attachment_id }}
+          TF_VAR_security_log_bucket_name:    "org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+        run: |
+          "$GITHUB_WORKSPACE/scripts/phase3-reconcile-vpn.sh"
+
+      - name: Terraform Plan
+        working-directory: terraform/networking
+        run: terraform plan -input=false -no-color -out=tfplan.bin
+        env:
+          TF_VAR_account_id:                    ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_on_prem_wan_ip:               ${{ secrets.TF_VAR_ON_PREM_WAN_IP }}
+          TF_VAR_corporate_account_id:         ${{ steps.resolve.outputs.corporate_account_id }}
+          TF_VAR_security_account_id:          ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_management_account_id:        ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_web_account_id:               ${{ steps.resolve.outputs.web_account_id }}
+          TF_VAR_corporate_tgw_attachment_id:  ${{ steps.resolve.outputs.corporate_tgw_attachment_id }}
+          TF_VAR_security_tgw_attachment_id:   ${{ steps.resolve.outputs.security_tgw_attachment_id }}
+          TF_VAR_management_tgw_attachment_id: ${{ steps.mgmt_att.outputs.management_tgw_attachment_id }}
+          TF_VAR_web_tgw_attachment_id:        ${{ steps.resolve.outputs.web_tgw_attachment_id }}
+          TF_VAR_security_log_bucket_name:     "org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+          TF_VAR_org_logs_bucket_exists:       "true"
+          # TF_VAR_aws_managed_domain_list_aggregate_id inherited from $GITHUB_ENV
+
+      - name: Checkov Plan Scan - networking-phase3
+        continue-on-error: true
+        working-directory: terraform/networking
+        run: |
+          pip install checkov --break-system-packages -q
+          terraform show -json tfplan.bin > /tmp/tfplan-networking-phase3.json
+          checkov -f /tmp/tfplan-networking-phase3.json \
+            --config-file "$GITHUB_WORKSPACE/checkov.yaml" \
+            --framework terraform_plan \
+            --output sarif \
+            --output-file-path /tmp/checkov-plan-networking-phase3-out/ \
+            2>&1 | tee /tmp/checkov-plan-networking-phase3.log || true
+          if [[ -f /tmp/checkov-plan-networking-phase3-out/results_sarif.sarif ]]; then
+            cp /tmp/checkov-plan-networking-phase3-out/results_sarif.sarif /tmp/checkov-plan-networking-phase3.sarif
+          else
+            echo '{"version":"2.1.0","runs":[]}' > /tmp/checkov-plan-networking-phase3.sarif
+          fi
+
+      - name: Upload Plan SARIF - networking-phase3
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: /tmp/checkov-plan-networking-phase3.sarif
+          category: checkov-plan-networking-phase3
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        working-directory: terraform/networking
+        run: terraform apply -auto-approve -no-color
+        env:
+          TF_VAR_account_id:                    ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_on_prem_wan_ip:               ${{ secrets.TF_VAR_ON_PREM_WAN_IP }}
+          TF_VAR_corporate_account_id:         ${{ steps.resolve.outputs.corporate_account_id }}
+          TF_VAR_security_account_id:          ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_management_account_id:        ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_web_account_id:               ${{ steps.resolve.outputs.web_account_id }}
+          TF_VAR_corporate_tgw_attachment_id:  ${{ steps.resolve.outputs.corporate_tgw_attachment_id }}
+          TF_VAR_security_tgw_attachment_id:   ${{ steps.resolve.outputs.security_tgw_attachment_id }}
+          TF_VAR_management_tgw_attachment_id: ${{ steps.mgmt_att.outputs.management_tgw_attachment_id }}
+          TF_VAR_web_tgw_attachment_id:        ${{ steps.resolve.outputs.web_tgw_attachment_id }}
+          TF_VAR_security_log_bucket_name:     "org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+          TF_VAR_org_logs_bucket_exists:       "true"
+          # TF_VAR_aws_managed_domain_list_aggregate_id inherited from $GITHUB_ENV
+
+      # -----------------------------------------------------------------------
+      # networking-web workspace -- internet-facing ALB + PrivateLink endpoint.
+      # Runs after the networking apply so the public_subnet_ids output is
+      # available in remote state.
+      # -----------------------------------------------------------------------
+
+      - name: Terraform Init - networking-web
+        working-directory: terraform/networking-web
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=networking-web/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform Plan - networking-web
+        working-directory: terraform/networking-web
+        run: terraform plan -input=false -no-color -out=tfplan-web.bin
+        env:
+          TF_VAR_account_id:                ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_state_bucket_name:         ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_web_endpoint_service_name: ${{ needs.deploy-web.outputs.endpoint_service_name }}
+
+      - name: Terraform Apply - networking-web
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        working-directory: terraform/networking-web
+        run: terraform apply -auto-approve -no-color tfplan-web.bin
+        env:
+          TF_VAR_account_id:                ${{ steps.resolve.outputs.account_id }}
+          TF_VAR_state_bucket_name:         ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_web_endpoint_service_name: ${{ needs.deploy-web.outputs.endpoint_service_name }}
+
+      - name: Capture ALB DNS - networking-web
+        if: always()
+        working-directory: terraform/networking-web
+        run: |
+          ALB_DNS=$(terraform output -raw web_alb_dns_name 2>/dev/null || echo "")
+          echo "### Web Ingress ALB" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "$ALB_DNS" ]]; then
+            echo "- DNS: \`${ALB_DNS}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- URL: http://${ALB_DNS}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- ALB not deployed (web_endpoint_service_name not set or apply skipped)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # -----------------------------------------------------------------------
+      # Corporate Phase 3 - apply log-destination resources now that the
+      # security account org-logs bucket and cross-account policy exist.
+      # -----------------------------------------------------------------------
+
+      - name: Resolve DNS Firewall ARN for Corporate Phase 3
+        id: resolve_dns_fw
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        run: |
+          DNS_FW_ARN="${{ needs.deploy-networking.outputs.dns_firewall_rule_group_arn }}"
+          DNS_FW_ID="${{ needs.deploy-networking.outputs.dns_firewall_rule_group_id }}"
+          NET_ID="${{ steps.resolve.outputs.account_id }}"
+          REGION="${AWS_DEFAULT_REGION}"
+
+          # Construct ARN from components when the direct output is empty.
+          if [[ -z "$DNS_FW_ARN" && -n "$DNS_FW_ID" && -n "$NET_ID" ]]; then
+            DNS_FW_ARN="arn:aws:route53resolver:${REGION}:${NET_ID}:firewall-rule-group/${DNS_FW_ID}"
+            echo "INFO: Constructed dns_firewall_rule_group_arn from components: ${DNS_FW_ARN}"
+          fi
+
+          # Last resort: AWS CLI lookup via the networking account role.
+          if [[ -z "$DNS_FW_ARN" ]]; then
+            echo "INFO: Falling back to AWS CLI for dns_firewall_rule_group_arn"
+            NET_CREDS=$(aws sts assume-role \
+              --role-arn "arn:aws:iam::${NET_ID}:role/OrganizationAccountAccessRole" \
+              --role-session-name "GitHubActions-Phase3-ResolveDNSFW" \
+              --output json 2>/dev/null || echo "{}")
+            DNS_FW_ARN=$(AWS_ACCESS_KEY_ID=$(echo "$NET_CREDS" | jq -r '.Credentials.AccessKeyId // empty') \
+              AWS_SECRET_ACCESS_KEY=$(echo "$NET_CREDS" | jq -r '.Credentials.SecretAccessKey // empty') \
+              AWS_SESSION_TOKEN=$(echo "$NET_CREDS" | jq -r '.Credentials.SessionToken // empty') \
+              aws route53resolver list-firewall-rule-groups \
+                --region "$REGION" \
+                --query "FirewallRuleGroups[?Name=='org-baseline-dns-firewall'].Arn|[0]" \
+                --output text 2>/dev/null || echo "")
+            [[ "$DNS_FW_ARN" == "None" ]] && DNS_FW_ARN=""
+          fi
+
+          [[ -z "$DNS_FW_ARN" ]] && echo "::warning::dns_firewall_rule_group_arn could not be resolved for corporate Phase 3."
+
+          echo "dns_firewall_rule_group_arn=${DNS_FW_ARN}" >> "$GITHUB_OUTPUT"
+          echo "  dns_firewall_rule_group_arn: ${DNS_FW_ARN:-(unresolved)}"
+
+      - name: Corporate Terraform Init
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        working-directory: terraform/corporate
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=corporate/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Corporate Terraform Apply - Log Resources
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        working-directory: terraform/corporate
+        run: terraform apply -auto-approve -no-color
+        env:
+          TF_VAR_account_id:                  ${{ steps.resolve.outputs.corporate_account_id }}
+          TF_VAR_transit_gateway_id:          ${{ needs.deploy-networking.outputs.transit_gateway_id }}
+          TF_VAR_dns_firewall_rule_group_arn: ${{ steps.resolve_dns_fw.outputs.dns_firewall_rule_group_arn }}
+          TF_VAR_org_logs_bucket_arn:         "arn:aws:s3:::org-logs-${{ steps.resolve.outputs.security_account_id }}-v2"
+          TF_VAR_org_logs_bucket_exists:      "true"
+          TF_VAR_on_prem_wan_ip:              ${{ secrets.TF_VAR_ON_PREM_WAN_IP }}
+          TF_VAR_security_account_id:         ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_state_bucket_name:           ${{ secrets.TFSTATE_BUCKET_NAME }}
+
+  # --------------------------------------------------------------------------
+  # Job 6 - Deploy Management Account
+  # --------------------------------------------------------------------------
+  deploy-management:
+    name: Deploy - management
+    runs-on: ubuntu-latest
+    environment: management
+    needs: [resolve-accounts, security-scan-hcl, deploy-networking, deploy-member-accounts]
+    if: |
+      always() &&
+      needs.resolve-accounts.result == 'success' &&
+      needs.deploy-networking.result == 'success' &&
+      (needs.deploy-member-accounts.result == 'success' ||
+       needs.deploy-member-accounts.result == 'failure')
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load buildspec
+        uses: ./.github/actions/load-buildspec
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    arn:aws:iam::${{ secrets.MANAGEMENT_ACCOUNT_ID }}:role/GitHub-OIDC
+          role-session-name: GitHubActions-Deploy-management
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Mask Org Data
+        run: |
+          while IFS= read -r v; do [ -n "$v" ] && echo "::add-mask::$v"; done \
+            < <(aws organizations list-accounts --query "Accounts[].Id" --output text | tr '\t' '\n')
+          while IFS= read -r v; do [ -n "$v" ] && echo "::add-mask::$v"; done \
+            < <(aws organizations list-accounts --query "Accounts[].Email" --output text | tr '\t' '\n')
+
+      # =====================================================================
+      # Cross-account CloudWatch observability links are now Terraform-native
+      # in this management workspace -- see terraform/management/observability_links.tf.
+      # Management is the org root and can assume OrganizationAccountAccessRole
+      # in any member account, so aliased providers in providers.tf handle the
+      # link creation in networking/corporate/web during this job's apply.
+      # =====================================================================
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform/management
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET_NAME }}" \
+            -backend-config="key=management/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform Format
+        working-directory: terraform/management
+        run: terraform fmt -recursive
+
+      - name: Terraform Validate
+        working-directory: terraform/management
+        run: terraform validate -no-color
+
+      - name: Management Account Import State
+        working-directory: terraform/management
+        env:
+          TF_VAR_account_id:             ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_security_account_id:    ${{ needs.resolve-accounts.outputs.security_account_id }}
+          TF_VAR_networking_account_id:  ${{ needs.resolve-accounts.outputs.networking_account_id }}
+          TF_VAR_corporate_account_id:   ${{ needs.resolve-accounts.outputs.corporate_account_id }}
+          TF_VAR_web_account_id:         ${{ needs.resolve-accounts.outputs.web_account_id }}
+          TF_VAR_state_bucket_name:      ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_enable_sso_assignments: "false"
+          IMPORT_MANAGEMENT_ACCOUNT_ID:  ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          IMPORT_SECURITY_ACCOUNT_ID:    ${{ needs.resolve-accounts.outputs.security_account_id }}
+          IMPORT_NETWORKING_ACCOUNT_ID:  ${{ needs.resolve-accounts.outputs.networking_account_id }}
+          IMPORT_CORPORATE_ACCOUNT_ID:   ${{ needs.resolve-accounts.outputs.corporate_account_id }}
+          IMPORT_WEB_ACCOUNT_ID:         ${{ needs.resolve-accounts.outputs.web_account_id }}
+        run: |
+          "$GITHUB_WORKSPACE/scripts/management-import-state.sh"
+
+      # Detect whether the AD Connector was previously provisioned by
+      # terraform-identity.yaml in the management account. If so, preserve it
+      # by passing identity_enabled=true so the regular deploy does not destroy it.
+      - name: Detect Identity Resources In State (management)
+        id: check_mgmt_identity
+        working-directory: terraform/management
+        run: |
+          IDENTITY="false"
+          if terraform state show 'aws_directory_service_directory.ad_connector[0]' > /dev/null 2>&1; then
+            IDENTITY="true"
+            echo "INFO: Management identity sentinel found in state: aws_directory_service_directory.ad_connector[0]"
+          fi
+          [[ "$IDENTITY" == "false" ]] && echo "INFO: No management identity resources found in state."
+          echo "identity_enabled=${IDENTITY}" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform Plan
+        working-directory: terraform/management
+        run: terraform plan -input=false -no-color -out=tfplan.bin
+        env:
+          TF_VAR_account_id:               ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_state_bucket_name:        ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_security_account_id:      ${{ needs.resolve-accounts.outputs.security_account_id }}
+          TF_VAR_networking_account_id:    ${{ needs.resolve-accounts.outputs.networking_account_id }}
+          TF_VAR_corporate_account_id:     ${{ needs.resolve-accounts.outputs.corporate_account_id }}
+          TF_VAR_web_account_id:           ${{ needs.resolve-accounts.outputs.web_account_id }}
+          TF_VAR_identity_enabled:         ${{ steps.check_mgmt_identity.outputs.identity_enabled || 'false' }}
+          TF_VAR_enable_sso_assignments:   "false"
+          TF_VAR_transit_gateway_id:       ${{ needs.deploy-networking.outputs.transit_gateway_id }}
+          TF_VAR_ad_connector_password:    ${{ secrets.TF_VAR_AD_CONNECTOR_PASSWORD }}
+
+      - name: Checkov Plan Scan - management
+        continue-on-error: true
+        working-directory: terraform/management
+        run: |
+          pip install checkov --break-system-packages -q
+          terraform show -json tfplan.bin > /tmp/tfplan-management.json
+          checkov -f /tmp/tfplan-management.json \
+            --config-file "$GITHUB_WORKSPACE/checkov.yaml" \
+            --framework terraform_plan \
+            --output sarif \
+            --output-file-path /tmp/checkov-plan-management.sarif \
+            2>&1 | tee /tmp/checkov-plan-management.log || true
+          [[ -f /tmp/checkov-plan-management.sarif ]] || \
+            echo '{"version":"2.1.0","runs":[]}' > /tmp/checkov-plan-management.sarif
+
+      - name: Upload Plan SARIF - management
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: /tmp/checkov-plan-management.sarif
+          category: checkov-plan-management
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        working-directory: terraform/management
+        run: |
+          "$GITHUB_WORKSPACE/scripts/tf-apply-filter.sh" management \
+            "InvalidS3BucketNameException" \
+            "S3 bucket name cannot be blank" \
+            "AccountAlreadyRegisteredException" \
+            "DuplicatePolicyException" \
+            "EventDataStoreAlreadyExistsException" \
+            "AlreadyExistsException" \
+            "InvalidPermission.Duplicate" \
+            "Organization Conformance Pack" \
+            "Link to arn:aws:oam"
+        env:
+          TF_VAR_account_id:               ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_state_bucket_name:        ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_security_account_id:      ${{ needs.resolve-accounts.outputs.security_account_id }}
+          TF_VAR_networking_account_id:    ${{ needs.resolve-accounts.outputs.networking_account_id }}
+          TF_VAR_corporate_account_id:     ${{ needs.resolve-accounts.outputs.corporate_account_id }}
+          TF_VAR_web_account_id:           ${{ needs.resolve-accounts.outputs.web_account_id }}
+          TF_VAR_identity_enabled:         ${{ steps.check_mgmt_identity.outputs.identity_enabled || 'false' }}
+          TF_VAR_enable_sso_assignments:   "false"
+          TF_VAR_transit_gateway_id:       ${{ needs.deploy-networking.outputs.transit_gateway_id }}
+          TF_VAR_ad_connector_password:    ${{ secrets.TF_VAR_AD_CONNECTOR_PASSWORD }}
