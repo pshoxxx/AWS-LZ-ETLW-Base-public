@@ -2655,11 +2655,23 @@ jobs:
       - name: Resolve Account IDs
         id: resolve
         run: |
+          # Look up every member account ID the management workspace needs.
+          # The aliased providers (security/networking/corporate/web) in
+          # terraform/management/providers.tf each build a role ARN from
+          # one of these variables. Leaving any unset produces a malformed
+          # ARN like "arn:aws:iam:::role/OrganizationAccountAccessRole",
+          # which fails AssumeRole during destroy refresh even though the
+          # aws_oam_link resources themselves are count-gated.
           echo "management_account_id=${{ secrets.MANAGEMENT_ACCOUNT_ID }}" >> $GITHUB_OUTPUT
-          SECURITY_ID=$(aws organizations list-accounts \
-            --query "Accounts[?Name=='security-environment'].Id|[0]" \
-            --output text)
-          echo "security_account_id=${SECURITY_ID}" >> $GITHUB_OUTPUT
+          ACCOUNTS=$(aws organizations list-accounts --output json)
+          SECURITY_ID=$(echo   "$ACCOUNTS" | jq -r '.Accounts[] | select(.Name=="security-environment"   and .Status=="ACTIVE") | .Id')
+          NETWORKING_ID=$(echo "$ACCOUNTS" | jq -r '.Accounts[] | select(.Name=="networking-environment" and .Status=="ACTIVE") | .Id')
+          CORPORATE_ID=$(echo  "$ACCOUNTS" | jq -r '.Accounts[] | select(.Name=="corporate-main-environment" and .Status=="ACTIVE") | .Id')
+          WEB_ID=$(echo        "$ACCOUNTS" | jq -r '.Accounts[] | select(.Name=="web-environment"        and .Status=="ACTIVE") | .Id')
+          echo "security_account_id=${SECURITY_ID}"     >> "$GITHUB_OUTPUT"
+          echo "networking_account_id=${NETWORKING_ID}" >> "$GITHUB_OUTPUT"
+          echo "corporate_account_id=${CORPORATE_ID}"   >> "$GITHUB_OUTPUT"
+          echo "web_account_id=${WEB_ID}"               >> "$GITHUB_OUTPUT"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -2819,6 +2831,133 @@ jobs:
             --region "$AWS_DEFAULT_REGION" 2>/dev/null && \
             echo "Deleted." || echo "Delete failed or already deleted -- continuing."
 
+      - name: Pre-Destroy Service Cleanup (GuardDuty/SecurityHub/Macie/Inspector)
+        # Every paid security service in the management account has the same
+        # teardown blocker: AWS rejects DisableService / DeleteDetector while
+        # the service still has invited or associated members, outstanding
+        # invitations, or active subscriptions. The management account
+        # accumulates these from the bootstrap window before each service's
+        # org admin is delegated to security, plus any re-enablement cycle.
+        # Clean them up here so Terraform's destroy calls below
+        # (aws_guardduty_detector.management, aws_securityhub_account.management,
+        # aws_macie2_account.main) don't bounce off the resulting AWS errors.
+        # Each block is independently idempotent and tolerates the service
+        # already being disabled.
+        run: |
+          REGION="$AWS_DEFAULT_REGION"
+
+          # --- GuardDuty -----------------------------------------------------
+          echo "[GuardDuty] Looking up management detector..."
+          GD_DETECTOR=$(aws guardduty list-detectors \
+            --region "$REGION" \
+            --query "DetectorIds | [0]" \
+            --output text 2>/dev/null || echo "")
+          if [[ -n "$GD_DETECTOR" && "$GD_DETECTOR" != "None" ]]; then
+            echo "[GuardDuty] Detector: ${GD_DETECTOR}"
+            GD_MEMBERS=$(aws guardduty list-members \
+              --detector-id "$GD_DETECTOR" --region "$REGION" \
+              --query "Members[].AccountId" --output text 2>/dev/null || echo "")
+            if [[ -n "$GD_MEMBERS" && "$GD_MEMBERS" != "None" ]]; then
+              echo "[GuardDuty] Disassociating members: ${GD_MEMBERS}"
+              aws guardduty disassociate-members \
+                --detector-id "$GD_DETECTOR" --region "$REGION" \
+                --account-ids $GD_MEMBERS 2>/dev/null || true
+              aws guardduty delete-members \
+                --detector-id "$GD_DETECTOR" --region "$REGION" \
+                --account-ids $GD_MEMBERS 2>/dev/null || true
+            fi
+            GD_INVITES=$(aws guardduty list-invitations \
+              --region "$REGION" \
+              --query "Invitations[].AccountId" --output text 2>/dev/null || echo "")
+            if [[ -n "$GD_INVITES" && "$GD_INVITES" != "None" ]]; then
+              echo "[GuardDuty] Deleting invitations: ${GD_INVITES}"
+              aws guardduty delete-invitations \
+                --region "$REGION" --account-ids $GD_INVITES 2>/dev/null || true
+            fi
+          else
+            echo "[GuardDuty] No detector -- skipping."
+          fi
+
+          # --- Security Hub --------------------------------------------------
+          echo "[SecurityHub] Checking enablement..."
+          SH_HUB=$(aws securityhub describe-hub --region "$REGION" \
+            --query "HubArn" --output text 2>/dev/null || echo "")
+          if [[ -n "$SH_HUB" && "$SH_HUB" != "None" ]]; then
+            SH_MEMBERS=$(aws securityhub list-members \
+              --region "$REGION" \
+              --query "Members[].AccountId" --output text 2>/dev/null || echo "")
+            if [[ -n "$SH_MEMBERS" && "$SH_MEMBERS" != "None" ]]; then
+              echo "[SecurityHub] Disassociating members: ${SH_MEMBERS}"
+              aws securityhub disassociate-members \
+                --region "$REGION" --account-ids $SH_MEMBERS 2>/dev/null || true
+              aws securityhub delete-members \
+                --region "$REGION" --account-ids $SH_MEMBERS 2>/dev/null || true
+            fi
+            SH_INVITES=$(aws securityhub list-invitations \
+              --region "$REGION" \
+              --query "Invitations[].AccountId" --output text 2>/dev/null || echo "")
+            if [[ -n "$SH_INVITES" && "$SH_INVITES" != "None" ]]; then
+              echo "[SecurityHub] Deleting invitations: ${SH_INVITES}"
+              aws securityhub delete-invitations \
+                --region "$REGION" --account-ids $SH_INVITES 2>/dev/null || true
+            fi
+            # Disable any enabled standards so disable-security-hub succeeds.
+            SH_STDS=$(aws securityhub get-enabled-standards \
+              --region "$REGION" \
+              --query "StandardsSubscriptions[].StandardsSubscriptionArn" \
+              --output text 2>/dev/null || echo "")
+            if [[ -n "$SH_STDS" && "$SH_STDS" != "None" ]]; then
+              echo "[SecurityHub] Disabling standards: ${SH_STDS}"
+              aws securityhub batch-disable-standards \
+                --region "$REGION" \
+                --standards-subscription-arns $SH_STDS 2>/dev/null || true
+            fi
+          else
+            echo "[SecurityHub] Not enabled -- skipping."
+          fi
+
+          # --- Macie ---------------------------------------------------------
+          echo "[Macie] Checking enablement..."
+          MACIE_STATUS=$(aws macie2 get-macie-session --region "$REGION" \
+            --query "status" --output text 2>/dev/null || echo "")
+          if [[ "$MACIE_STATUS" == "ENABLED" || "$MACIE_STATUS" == "PAUSED" ]]; then
+            MACIE_MEMBERS=$(aws macie2 list-members --region "$REGION" \
+              --query "members[].accountId" --output text 2>/dev/null || echo "")
+            if [[ -n "$MACIE_MEMBERS" && "$MACIE_MEMBERS" != "None" ]]; then
+              for ACCT in $MACIE_MEMBERS; do
+                echo "[Macie] Disassociating ${ACCT}"
+                aws macie2 disassociate-member \
+                  --id "$ACCT" --region "$REGION" 2>/dev/null || true
+                aws macie2 delete-member \
+                  --id "$ACCT" --region "$REGION" 2>/dev/null || true
+              done
+            fi
+            MACIE_INVITES=$(aws macie2 list-invitations --region "$REGION" \
+              --query "invitations[].accountId" --output text 2>/dev/null || echo "")
+            if [[ -n "$MACIE_INVITES" && "$MACIE_INVITES" != "None" ]]; then
+              echo "[Macie] Deleting invitations: ${MACIE_INVITES}"
+              aws macie2 delete-invitations \
+                --region "$REGION" --account-ids $MACIE_INVITES 2>/dev/null || true
+            fi
+          else
+            echo "[Macie] Not enabled (status: ${MACIE_STATUS:-none}) -- skipping."
+          fi
+
+          # --- Inspector v2 --------------------------------------------------
+          # Inspector v2 uses a delegated-admin model, not a member/invite
+          # model -- but the management account can still be "enabled" for
+          # scanning, which costs money per resource. Disable explicitly.
+          echo "[Inspector2] Disabling for management account..."
+          MGMT_ACCT=$(aws sts get-caller-identity --query Account --output text)
+          aws inspector2 disable \
+            --account-ids "$MGMT_ACCT" \
+            --resource-types EC2 ECR LAMBDA LAMBDA_CODE \
+            --region "$REGION" 2>/dev/null \
+            && echo "[Inspector2] Disabled." \
+            || echo "[Inspector2] Already disabled or not enabled."
+
+          echo "Pre-destroy service cleanup complete."
+
       - name: Terraform Destroy
         working-directory: terraform/management
         run: |
@@ -2841,10 +2980,143 @@ jobs:
           fi
           echo "Management destroy complete."
         env:
-          TF_VAR_account_id:          ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
-          TF_VAR_security_account_id: ${{ steps.resolve.outputs.security_account_id }}
-          TF_VAR_environment:         dev
-          TF_VAR_state_bucket_name:   ${{ secrets.TFSTATE_BUCKET_NAME }}
+          TF_VAR_account_id:            ${{ secrets.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_security_account_id:   ${{ steps.resolve.outputs.security_account_id }}
+          TF_VAR_networking_account_id: ${{ steps.resolve.outputs.networking_account_id }}
+          TF_VAR_corporate_account_id:  ${{ steps.resolve.outputs.corporate_account_id }}
+          TF_VAR_web_account_id:        ${{ steps.resolve.outputs.web_account_id }}
+          TF_VAR_environment:           dev
+          TF_VAR_state_bucket_name:     ${{ secrets.TFSTATE_BUCKET_NAME }}
+
+      - name: Fully Disable Security Account Services
+        # Only runs on full teardown (destroy_state_bucket=true). Normally
+        # destroy-security state-rm's the security account's GuardDuty,
+        # Security Hub, Macie, Inspector v2, and Access Analyzer so they
+        # keep running for fast re-import on the next deploy -- but they
+        # keep billing too. On full teardown there is no next deploy from
+        # this state, so disable them here for real.
+        #
+        # Runs AFTER Terraform Destroy above so the security-service-
+        # protection SCP (aws_organizations_policy.security_service_protection
+        # in management_scps.tf) has been deleted and won't deny the
+        # service-level disable calls below.
+        if: ${{ github.event.inputs.destroy_state_bucket == 'true' }}
+        run: |
+          REGION="$AWS_DEFAULT_REGION"
+          SECURITY_ID="${{ steps.resolve.outputs.security_account_id }}"
+          if [[ -z "$SECURITY_ID" || "$SECURITY_ID" == "None" ]]; then
+            echo "Security account ID not resolved -- skipping."
+            exit 0
+          fi
+
+          echo "Assuming OrganizationAccountAccessRole in security (${SECURITY_ID})..."
+          CREDS=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::${SECURITY_ID}:role/OrganizationAccountAccessRole" \
+            --role-session-name "GitHubActions-DisableSecurityServices" \
+            --output json) || { echo "ERROR: assume-role failed."; exit 1; }
+          export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.Credentials.SessionToken')
+
+          # --- GuardDuty ----------------------------------------------------
+          GD=$(aws guardduty list-detectors --region "$REGION" \
+            --query "DetectorIds | [0]" --output text 2>/dev/null || echo "")
+          if [[ -n "$GD" && "$GD" != "None" ]]; then
+            echo "[Security/GuardDuty] Detector: ${GD}"
+            GD_MEMBERS=$(aws guardduty list-members --detector-id "$GD" \
+              --region "$REGION" --query "Members[].AccountId" --output text 2>/dev/null || echo "")
+            if [[ -n "$GD_MEMBERS" && "$GD_MEMBERS" != "None" ]]; then
+              aws guardduty disassociate-members --detector-id "$GD" \
+                --region "$REGION" --account-ids $GD_MEMBERS 2>/dev/null || true
+              aws guardduty delete-members --detector-id "$GD" \
+                --region "$REGION" --account-ids $GD_MEMBERS 2>/dev/null || true
+            fi
+            GD_INV=$(aws guardduty list-invitations --region "$REGION" \
+              --query "Invitations[].AccountId" --output text 2>/dev/null || echo "")
+            if [[ -n "$GD_INV" && "$GD_INV" != "None" ]]; then
+              aws guardduty delete-invitations --region "$REGION" \
+                --account-ids $GD_INV 2>/dev/null || true
+            fi
+            aws guardduty delete-detector --detector-id "$GD" --region "$REGION" 2>/dev/null \
+              && echo "[Security/GuardDuty] Detector deleted." \
+              || echo "[Security/GuardDuty] Detector delete failed (may have lingering deps)."
+          else
+            echo "[Security/GuardDuty] No detector."
+          fi
+
+          # --- Security Hub -------------------------------------------------
+          SH=$(aws securityhub describe-hub --region "$REGION" \
+            --query "HubArn" --output text 2>/dev/null || echo "")
+          if [[ -n "$SH" && "$SH" != "None" ]]; then
+            SH_MEMBERS=$(aws securityhub list-members --region "$REGION" \
+              --query "Members[].AccountId" --output text 2>/dev/null || echo "")
+            if [[ -n "$SH_MEMBERS" && "$SH_MEMBERS" != "None" ]]; then
+              aws securityhub disassociate-members --region "$REGION" \
+                --account-ids $SH_MEMBERS 2>/dev/null || true
+              aws securityhub delete-members --region "$REGION" \
+                --account-ids $SH_MEMBERS 2>/dev/null || true
+            fi
+            SH_INV=$(aws securityhub list-invitations --region "$REGION" \
+              --query "Invitations[].AccountId" --output text 2>/dev/null || echo "")
+            if [[ -n "$SH_INV" && "$SH_INV" != "None" ]]; then
+              aws securityhub delete-invitations --region "$REGION" \
+                --account-ids $SH_INV 2>/dev/null || true
+            fi
+            SH_STDS=$(aws securityhub get-enabled-standards --region "$REGION" \
+              --query "StandardsSubscriptions[].StandardsSubscriptionArn" --output text 2>/dev/null || echo "")
+            if [[ -n "$SH_STDS" && "$SH_STDS" != "None" ]]; then
+              aws securityhub batch-disable-standards --region "$REGION" \
+                --standards-subscription-arns $SH_STDS 2>/dev/null || true
+            fi
+            aws securityhub disable-security-hub --region "$REGION" 2>/dev/null \
+              && echo "[Security/SecurityHub] Disabled." \
+              || echo "[Security/SecurityHub] Disable failed."
+          else
+            echo "[Security/SecurityHub] Not enabled."
+          fi
+
+          # --- Macie --------------------------------------------------------
+          MACIE_STATUS=$(aws macie2 get-macie-session --region "$REGION" \
+            --query "status" --output text 2>/dev/null || echo "")
+          if [[ "$MACIE_STATUS" == "ENABLED" || "$MACIE_STATUS" == "PAUSED" ]]; then
+            MACIE_MEMBERS=$(aws macie2 list-members --region "$REGION" \
+              --query "members[].accountId" --output text 2>/dev/null || echo "")
+            for ACCT in $MACIE_MEMBERS; do
+              aws macie2 disassociate-member --id "$ACCT" --region "$REGION" 2>/dev/null || true
+              aws macie2 delete-member       --id "$ACCT" --region "$REGION" 2>/dev/null || true
+            done
+            MACIE_INV=$(aws macie2 list-invitations --region "$REGION" \
+              --query "invitations[].accountId" --output text 2>/dev/null || echo "")
+            if [[ -n "$MACIE_INV" && "$MACIE_INV" != "None" ]]; then
+              aws macie2 delete-invitations --region "$REGION" \
+                --account-ids $MACIE_INV 2>/dev/null || true
+            fi
+            aws macie2 disable-macie --region "$REGION" 2>/dev/null \
+              && echo "[Security/Macie] Disabled." \
+              || echo "[Security/Macie] Disable failed."
+          else
+            echo "[Security/Macie] Not enabled (status: ${MACIE_STATUS:-none})."
+          fi
+
+          # --- Inspector v2 -------------------------------------------------
+          aws inspector2 disable \
+            --account-ids "$SECURITY_ID" \
+            --resource-types EC2 ECR LAMBDA LAMBDA_CODE \
+            --region "$REGION" 2>/dev/null \
+            && echo "[Security/Inspector2] Disabled." \
+            || echo "[Security/Inspector2] Already disabled or not enabled."
+
+          # --- Access Analyzer ---------------------------------------------
+          ANALYZERS=$(aws accessanalyzer list-analyzers --region "$REGION" \
+            --query "analyzers[].name" --output text 2>/dev/null || echo "")
+          for A in $ANALYZERS; do
+            aws accessanalyzer delete-analyzer --analyzer-name "$A" --region "$REGION" 2>/dev/null \
+              && echo "[Security/AccessAnalyzer] Deleted ${A}." \
+              || echo "[Security/AccessAnalyzer] Delete failed for ${A}."
+          done
+
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+          echo "Security account services fully disabled."
 
   # --------------------------------------------------------------------------
   # Job 5 - Destroy Bootstrap State Bucket (optional)
